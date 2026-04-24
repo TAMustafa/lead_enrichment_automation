@@ -1,0 +1,7 @@
+.env
+.venv
+update_notebook_v2.py
+uv.lock
+__pycache__
+.DS_Store
+.python-version

@@ -1,0 +1,13 @@
+[project]
+name = "lead-enrichment-automation"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-search-results>=2.4.2",
+    "pandas>=3.0.2",
+    "python-dotenv>=1.2.2",
+    "simple-salesforce>=1.12.9",
+    "tqdm>=4.67.3",
+]
