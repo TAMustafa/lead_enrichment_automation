@@ -161,7 +161,7 @@ with ThreadPoolExecutor(max_workers=10) as executor:
         if res:
             preview_rows.append(res)
 
-# Update Salesforce
+# Update Salesforce in Batches
 if not (preview_df := pd.DataFrame(preview_rows)).empty:
     # Clean data: Replace NaN with None (Salesforce doesn't accept NaN in JSON)
     records = preview_df.replace({pd.NA: None, float('nan'): None}).to_dict('records')
@@ -170,12 +170,23 @@ if not (preview_df := pd.DataFrame(preview_rows)).empty:
     
     try:
         logger.info(f"Updating {len(records)} leads in Salesforce...")
-        results = sf.bulk.Lead.update(records)
-        successes = [r for r in results if r["success"]]
-        failures = [r for r in results if not r["success"]]
-        logger.info(f"Update complete: {len(successes)} successful, {len(failures)} failed")
-        for f in failures:
-            logger.error(f"Failed to update record: {f.get('errors')}")
+        BATCH_SIZE = 2000
+        all_successes = []
+        all_failures = []
+        
+        for i in range(0, len(records), BATCH_SIZE):
+            batch = records[i:i + BATCH_SIZE]
+            logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {(len(records) + BATCH_SIZE - 1)//BATCH_SIZE}...")
+            results = sf.bulk.Lead.update(batch)
+            
+            all_successes.extend([r for r in results if r["success"]])
+            failures = [r for r in results if not r["success"]]
+            all_failures.extend(failures)
+            
+            for f in failures:
+                logger.error(f"Failed to update record: {f.get('errors')}")
+                
+        logger.info(f"Update complete: {len(all_successes)} successful, {len(all_failures)} failed")
     except Exception as e:
         logger.error(f"Bulk update failed: {e}")
 else:

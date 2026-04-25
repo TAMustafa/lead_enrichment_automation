@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import json
 import logging
 import requests
@@ -39,6 +40,39 @@ def extract_payment_options(place: Dict[str, Any]) -> Optional[str]:
     for item in place.get("extensions", []):
         if "payments" in item:
             return ", ".join(item["payments"])
+    return None
+
+def determine_cuisine_from_text(text: str) -> Optional[str]:
+    cuisines = [
+        "Italian", "Mexican", "Chinese", "Japanese", "Indian", "Thai", "French",
+        "Spanish", "Greek", "Mediterranean", "Middle Eastern", "Korean", "Vietnamese",
+        "American", "British", "Pizza", "Burger", "Sushi", "Seafood", "Vegan",
+        "Vegetarian", "BBQ", "Steakhouse", "Turkish", "Lebanese", "Caribbean"
+    ]
+    text_lower = text.lower()
+    counts = {}
+    for c in cuisines:
+        count = text_lower.count(c.lower())
+        if count > 0:
+            counts[c] = count
+            
+    if counts:
+        sorted_cuisines = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        return sorted_cuisines[0][0]
+    return None
+
+def fetch_menu_and_determine_cuisine(menu_link: Optional[str], website: Optional[str]) -> Optional[str]:
+    urls_to_try = [url for url in [menu_link, website] if url]
+    for url in urls_to_try:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                cuisine = determine_cuisine_from_text(res.text)
+                if cuisine:
+                    return cuisine
+        except Exception:
+            pass
     return None
 
 def extract_opening_hours(place: Dict[str, Any]) -> Optional[str]:
@@ -89,23 +123,27 @@ def extract_cuisines(place: Dict[str, Any]) -> Dict[str, Optional[str]]:
                 if cleaned not in cuisines:
                     cuisines.append(cleaned)
                     
-    cuisine_type = ", ".join(cuisines) if cuisines else None
     primary_cuisine = cuisines[0] if len(cuisines) > 0 else None
     secondary_cuisine = cuisines[1] if len(cuisines) > 1 else None
 
-    # Truncate to avoid Salesforce STRING_TOO_LONG errors (assuming 15 char limit)
-    if cuisine_type and len(cuisine_type) > 15:
-        # If it's a list, try to just use primary
-        cuisine_type = primary_cuisine[:15] if primary_cuisine else cuisine_type[:15]
-    if primary_cuisine and len(primary_cuisine) > 15:
-        primary_cuisine = primary_cuisine[:15]
-    if secondary_cuisine and len(secondary_cuisine) > 15:
-        secondary_cuisine = secondary_cuisine[:15]
+    # Menu/Website Fallback Check for deeper accuracy
+    menu_link = place.get("menu_link") or (place.get("links", {}) and place.get("links", {}).get("menu"))
+    website = place.get("website")
+    
+    # Only scrape if primary_cuisine is missing or extremely generic
+    if not primary_cuisine or primary_cuisine.lower() in {'food', 'store', 'point of interest', 'establishment'}:
+        scraped_cuisine = fetch_menu_and_determine_cuisine(menu_link, website)
+        if scraped_cuisine:
+            primary_cuisine = scraped_cuisine
+            if scraped_cuisine not in cuisines:
+                cuisines.insert(0, scraped_cuisine)
+                
+    cuisine_type = ", ".join(cuisines) if cuisines else None
 
     return {
-        "cuisine_type": cuisine_type,
-        "primary_cuisine": primary_cuisine,
-        "secondary_cuisine": secondary_cuisine
+        "cuisine_type": cuisine_type[:255] if cuisine_type else None,
+        "primary_cuisine": primary_cuisine[:255] if primary_cuisine else None,
+        "secondary_cuisine": secondary_cuisine[:255] if secondary_cuisine else None
     }
 
 def extract_address_components(place: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -165,16 +203,30 @@ def evaluate_qualification(
         norm_sf_street = normalize_string(sf_street)
         norm_sf_postcode = normalize_string(sf_postcode)
         
-        # Check if either street or postcode is found in the Google address
-        street_match = norm_sf_street and norm_sf_street in norm_google_addr
-        postcode_match = norm_sf_postcode and norm_sf_postcode in norm_google_addr
+        # Fuzzy match for street
+        street_match = False
+        if norm_sf_street:
+            # partial_ratio is good because '123 main st' is a substring of '123 main street'
+            match_score = max(fuzz.partial_ratio(norm_sf_street, norm_google_addr), 
+                              fuzz.token_set_ratio(norm_sf_street, norm_google_addr))
+            if match_score > 75:
+                street_match = True
+                
+        # Substring or Fuzzy match for postcode
+        postcode_match = False
+        if norm_sf_postcode:
+            if norm_sf_postcode in norm_google_addr or fuzz.partial_ratio(norm_sf_postcode, norm_google_addr) > 85:
+                postcode_match = True
         
         if not street_match and not postcode_match:
             return "Disqualified", f"Automation Disqualified: Location Mismatch (SF Address: '{sf_street} {sf_postcode}', Google: '{google_address}')."
 
     # 3. Name Match Check
     if norm_google_name and norm_sf_name:
-        match_score = fuzz.token_set_ratio(norm_sf_name, norm_google_name)
+        match_score = max(
+            fuzz.token_set_ratio(norm_sf_name, norm_google_name),
+            fuzz.partial_ratio(norm_sf_name, norm_google_name)
+        )
         if match_score < 75:
             # Exception: if it's a generic establishment type, we might be more lenient, 
             # but usually a name mismatch is a dealbreaker.
@@ -248,11 +300,27 @@ class MarketHandler:
             
         params = {"engine": "google_maps", "api_key": self.api_key, "gl": self._get_gl()}
         
+        # Rate Limiting & Retry helper
+        def fetch_with_retry(search_params, retries=3, delay=1.5):
+            for attempt in range(retries):
+                try:
+                    res = GoogleSearch(search_params).get_dict()
+                    if "error" in res and "rate limit" in str(res.get("error")).lower():
+                        logger.warning(f"SerpAPI Rate limit hit. Retrying in {delay * (attempt + 1)}s...")
+                        time.sleep(delay * (attempt + 1))
+                        continue
+                    return res
+                except Exception as ex:
+                    if attempt == retries - 1:
+                        raise ex
+                    time.sleep(delay * (attempt + 1))
+            return {}
+
         # Strategy 1: Try Place ID
         if place_id:
             params["place_id"] = place_id
             try:
-                results = GoogleSearch(params).get_dict()
+                results = fetch_with_retry(params)
                 if place := results.get("place_results"):
                     return self._process_results(place, lead_row)
             except Exception as e:
@@ -267,15 +335,22 @@ class MarketHandler:
         params.pop("place_id", None)
         params["q"] = search_query
         try:
-            results = GoogleSearch(params).get_dict()
+            results = fetch_with_retry(params)
             if place := results.get("place_results"):
                 return self._process_results(place, lead_row)
             elif local := results.get("local_results"):
-                # Filter local results for name match if possible
+                # Filter local results for best name match using fuzzy logic
+                best_match = local[0]
+                best_score = 0
                 for r in local:
-                    if normalize_string(name) in normalize_string(r.get("title")):
-                        return self._process_results(r, lead_row)
-                return self._process_results(local[0], lead_row)
+                    score = max(
+                        fuzz.token_set_ratio(normalize_string(name), normalize_string(r.get("title", ""))),
+                        fuzz.partial_ratio(normalize_string(name), normalize_string(r.get("title", "")))
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_match = r
+                return self._process_results(best_match, lead_row)
         except Exception as e:
             logger.error(f"Fallback search failed for {search_query}: {e}")
             
@@ -328,33 +403,60 @@ class UKMarketHandler(MarketHandler):
         try:
             headers = {"x-api-version": "2", "Accept": "application/json"}
             params = {"name": search_name, "address": postcode} if postcode else {"name": search_name}
-            res = requests.get(f"{self.FSA_API_BASE}/Establishments", params=params, headers=headers, timeout=5)
             
-            if res.status_code == 200:
+            # Rate limit retry helper for FSA API
+            def fetch_fsa(query_params):
+                for attempt in range(3):
+                    resp = requests.get(f"{self.FSA_API_BASE}/Establishments", params=query_params, headers=headers, timeout=5)
+                    if resp.status_code == 429:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return resp
+                return None
+
+            res = fetch_fsa(params)
+            establishments = []
+            if res and res.status_code == 200:
                 establishments = res.json().get("establishments", [])
-                if establishments:
-                    # Look for the best match in results
-                    match = establishments[0]
-                    for e in establishments:
-                        if fuzz.token_set_ratio(normalize_string(raw_name), normalize_string(e.get("BusinessName"))) >= 80:
-                            match = e
-                            break
-                            
-                    # Map numeric ratings to your Salesforce picklist words
-                    rating_map = {
-                        "0": "ZERO", "1": "ONE", "2": "TWO", 
-                        "3": "THREE", "4": "FOUR", "5": "FIVE"
-                    }
-                    raw_rating = str(match.get("RatingValue"))
-                    
-                    data.update({
-                        "FSA_AGENCY": match.get("LocalAuthorityName"),
-                        "FSA_RATING": rating_map.get(raw_rating, raw_rating),
-                        "FSA_URL": f"https://ratings.food.gov.uk/business/en-GB/{match.get('FHRSID')}"
-                    })
-                    logger.info(f"FSA data found for {raw_name}")
-                else:
-                    logger.info(f"No FSA data found for {search_name} in {postcode}")
+
+            # Fallback: if name search failed but we have a postcode, try local fuzzy match
+            if not establishments and postcode:
+                res_pc = fetch_fsa({"address": postcode})
+                if res_pc and res_pc.status_code == 200:
+                    pc_estabs = res_pc.json().get("establishments", [])
+                    for e in pc_estabs:
+                        b_name = normalize_string(e.get("BusinessName", ""))
+                        if fuzz.token_set_ratio(search_name, b_name) >= 70 or fuzz.partial_ratio(search_name, b_name) >= 75:
+                            establishments.append(e)
+
+            if establishments:
+                # Look for the best match in results
+                match = establishments[0]
+                best_score = 0
+                for e in establishments:
+                    score = max(
+                        fuzz.token_set_ratio(search_name, normalize_string(e.get("BusinessName", ""))),
+                        fuzz.partial_ratio(search_name, normalize_string(e.get("BusinessName", "")))
+                    )
+                    if score > best_score:
+                        best_score = score
+                        match = e
+                        
+                # Map numeric ratings to your Salesforce picklist words
+                rating_map = {
+                    "0": "ZERO", "1": "ONE", "2": "TWO", 
+                    "3": "THREE", "4": "FOUR", "5": "FIVE"
+                }
+                raw_rating = str(match.get("RatingValue"))
+                
+                data.update({
+                    "FSA_AGENCY": match.get("LocalAuthorityName"),
+                    "FSA_RATING": rating_map.get(raw_rating, raw_rating),
+                    "FSA_URL": f"https://ratings.food.gov.uk/business/en-GB/{match.get('FHRSID')}"
+                })
+                logger.info(f"FSA data found for {raw_name}")
+            else:
+                logger.info(f"No FSA data found for {search_name} in {postcode}")
         except requests.exceptions.RequestException as e:
             logger.error(f"FSA API request error: {e}")
         except Exception as e:
