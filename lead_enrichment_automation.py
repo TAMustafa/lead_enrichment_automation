@@ -1,14 +1,22 @@
 import os
-import re
-import json
 import datetime
 import logging
 import pandas as pd
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
 from serpapi import GoogleSearch
 from simple_salesforce import Salesforce
+
+# Import modularized logic
+from logic import (
+    extract_store_type,
+    extract_service_options,
+    extract_payment_options,
+    extract_address_components,
+    evaluate_qualification,
+    pre_qualify_lead
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -24,97 +32,9 @@ SF_TOKEN = os.getenv('SF_TOKEN')
 SERP_API = os.getenv('SERP_API')
 
 required = ['SF_USERNAME', 'SF_PASSWORD', 'SF_TOKEN', 'SERP_API']
-missing = [v for v in required if not os.getenv(v)]
-if missing:
+if missing := [v for v in required if not os.getenv(v)]:
     raise ValueError(f"Missing environment variables: {', '.join(missing)}")
 logger.info("Configuration loaded successfully")
-
-# Load Qualification Rules from JSON
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'qualification_config.json')
-try:
-    with open(CONFIG_PATH, 'r') as f:
-        QUAL_RULES = json.load(f).get('rules', {})
-    logger.info("Qualification rules loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to load qualification rules: {e}")
-    QUAL_RULES = {}
-
-# Utility Functions to parse Google Maps Data
-def extract_store_type(place: Dict[str, Any]) -> Optional[str]:
-    types = place.get("type", [])
-    return ", ".join(types) if isinstance(types, list) else None
-
-def extract_service_options(place: Dict[str, Any]) -> Optional[str]:
-    options = place.get("service_options", {})
-    return ", ".join([k for k, v in options.items() if v]) if isinstance(options, dict) else None
-
-def extract_payment_options(place: Dict[str, Any]) -> Optional[str]:
-    for item in place.get("extensions", []):
-        if "payments" in item:
-            return ", ".join(item["payments"])
-    return None
-
-def extract_address_components(place: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """Parse address components from full address string with improved robustness."""
-    full_address = place.get("address", "")
-    res = {"street": None, "city": None, "postal_code": None, "country": None}
-    if not full_address: return res
-        
-    parts = [p.strip() for p in full_address.split(",")]
-    if len(parts) >= 1: res["street"] = parts[0]
-    if len(parts) >= 2:
-        res["country"] = parts[-1]
-        city_postal_part = parts[-2] if len(parts) > 2 else parts[1]
-        postal_match = re.search(r'\b\d{4,5}(?:[-\s][A-Z]{1,2})?\b', city_postal_part)
-        if postal_match:
-            res["postal_code"] = postal_match.group()
-            res["city"] = city_postal_part.replace(res["postal_code"], "").strip().strip(',')
-        else:
-            res["city"] = city_postal_part
-    return res
-
-def evaluate_qualification(sf_name: str, google_name: Optional[str], types: List[str], service_options: Dict[str, Any], business_status: Optional[str] = None, permanently_closed: bool = False) -> (str, Optional[str]):
-    """
-    Qualification logic based on Restaurant standards defined in config.
-    Returns (status, reason)
-    """
-    # Check both names for keywords to be more accurate
-    combined_name = f"{sf_name} {google_name or ''}".lower()
-    norm_types = [t.lower() for t in types]
-    
-    # 0. Check Business Operational Status (Closed/Out of Business)
-    if permanently_closed or business_status == "CLOSED_PERMANENTLY":
-        return "Disqualified", "Automation Disqualified: Location is marked as Permanently Closed on Google Maps."
-    
-    if business_status == "CLOSED_TEMPORARILY":
-        return "Disqualified", "Automation Disqualified: Location is marked as Temporarily Closed on Google Maps."
-
-    # 1. Always Disqualify Types (Schools, Hotels, etc.)
-    blacklisted = QUAL_RULES.get('always_disqualify_types', [])
-    for t in norm_types:
-        if t in blacklisted:
-            return "Disqualified", f"Automation Disqualified: Category '{t}' is on the exclusion list."
-
-    # 2. Residential check
-    res_signals = QUAL_RULES.get('residential_signals', [])
-    res_exceptions = QUAL_RULES.get('residential_exception_types', [])
-    is_residential = any(s in norm_types for s in res_signals) and not any(e in norm_types for e in res_exceptions)
-    
-    if is_residential:
-        return "Disqualified", "Automation Disqualified: Residential Address (No public business listing found)."
-    
-    # 3. Bar/Cafe/Pub delivery requirement check
-    req_types = QUAL_RULES.get('require_delivery_for_types', [])
-    req_keywords = QUAL_RULES.get('require_delivery_for_name_keywords', [])
-    
-    # Check if business matches by type OR by name keyword
-    is_target_business = any(t in norm_types for t in req_types) or any(k in combined_name for k in req_keywords)
-    has_delivery = service_options.get("delivery", False)
-    
-    if is_target_business and not has_delivery:
-        return "Disqualified", "Automation Disqualified: Establishment identified as Bar/Cafe/Pub without an active delivery service."
-        
-    return "Qualified", None
 
 def enrich_with_serpapi(place_id: Optional[str] = None, name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Enrich lead data using SerpAPI Google Maps search."""
@@ -122,12 +42,14 @@ def enrich_with_serpapi(place_id: Optional[str] = None, name: Optional[str] = No
     params = {"engine": "google_maps", "api_key": SERP_API}
     if place_id: params["place_id"] = place_id
     else: params["q"] = name
+    
     try:
         results = GoogleSearch(params).get_dict()
         place = results.get("place_results", {})
         if not place:
             logger.warning(f"No results for {place_id or name}")
             return None
+            
         addr = extract_address_components(place)
         return {
             "google_name": place.get("title"),
@@ -166,7 +88,6 @@ try:
     leads = sf.query(query)['records']
     df = pd.DataFrame(leads).drop(columns=['attributes'], errors='ignore')
     logger.info(f"Retrieved {len(df)} leads to enrich")
-    if not df.empty: print(df.head()) # Not needed in Production
 except Exception as e:
     logger.error(f"Salesforce operation failed: {e}")
     raise
@@ -175,6 +96,22 @@ except Exception as e:
 preview_rows = []
 for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
     try:
+        # 1. Pre-Qualification Check (FREE)
+        is_pre_qualified, pre_reason = pre_qualify_lead(row)
+        
+        if not is_pre_qualified:
+            logger.info(f"Lead {row['Name']} disqualified early (Saving Credits): {pre_reason}")
+            merged = {
+                "Id": row["Id"],
+                "Qualification_Status__c": "Disqualified",
+                "Disqualification_Reason__c": pre_reason[:255],
+                "Status": "Disqualified",
+                "Date_Enriched_At__c": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            preview_rows.append(merged)
+            continue
+
+        # 2. Enrichment (PAID - Costs 1 Credit)
         data = enrich_with_serpapi(place_id=row.get("Google_Place_ID__c"), name=row.get("Name"))
         if data:
             # Merge logic: Only fill fields that are empty in Salesforce
@@ -206,9 +143,8 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
             # Update Salesforce Custom Fields
             merged["Qualification_Status__c"] = status
             if reason:
-                # Ensure reason fits in 255 characters
                 merged["Disqualification_Reason__c"] = reason[:255]
-                merged["Status"] = "Disqualified" # Also update standard status for visibility
+                merged["Status"] = "Disqualified"
                 logger.info(f"Lead {row['Name']} disqualified: {reason}")
             else:
                 merged["Status"] = "Qualified"
@@ -224,28 +160,18 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
     except Exception as e:
         logger.error(f"Failed to process lead {row.get('Name')} ({row.get('Id')}): {e}")
         continue
-preview_df = pd.DataFrame(preview_rows)
-logger.info(f"Successfully enriched {len(preview_df)} leads")
-if not preview_df.empty: print(preview_df.head()) # Not needed in Production
 
 # Update Salesforce
-if not preview_df.empty:
+if not (preview_df := pd.DataFrame(preview_rows)).empty:
     records = preview_df.to_dict('records')
-    # Remove 'Name' if updating standard objects to avoid errors (Id is enough)
-    for r in records: r.pop('Name', None)
+    for r in records: r.pop('Name', None) # Id is enough for update
     
     try:
         logger.info(f"Updating {len(records)} leads in Salesforce...")
         results = sf.bulk.Lead.update(records)
         successes = [r for r in results if r["success"]]
         failures = [r for r in results if not r["success"]]
-        
         logger.info(f"Update complete: {len(successes)} successful, {len(failures)} failed")
-        if failures:
-            for i, f in enumerate(failures[:5]):
-                lead_id = records[results.index(f)]['Id']
-                errors = f.get('errors', [])
-                logger.error(f"Lead {lead_id} failed: {errors[0].get('message') if errors else 'Unknown error'}")
     except Exception as e:
         logger.error(f"Bulk update failed: {e}")
 else:

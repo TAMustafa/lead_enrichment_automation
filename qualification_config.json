@@ -31,11 +31,30 @@
     ],
     "residential_signals": [
       "premise",
-      "subpremise"
+      "subpremise",
+      "street_address",
+      "route"
     ],
     "residential_exception_types": [
       "establishment",
       "point_of_interest"
-    ]
+    ],
+    "pre_qualification_rules": {
+      "disqualify_name_keywords": [
+        "test",
+        "sample",
+        "fake",
+        "duplicate",
+        "junk"
+      ],
+      "disqualify_address_keywords": [
+        "apt",
+        "apartment",
+        "unit",
+        "room",
+        "floor",
+        "suite"
+      ]
+    }
   }
 }

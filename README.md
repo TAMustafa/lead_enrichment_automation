@@ -1,34 +1,39 @@
 # Lead Enrichment & Qualification Automation
 
-A Python-based automation tool to enrich Salesforce Lead records with detailed business information and automatically qualify/disqualify them based on restaurant industry standards.
+A professional Python-based automation tool designed to enrich Salesforce Lead records with detailed business information and automatically qualify or disqualify them using a rule-based engine.
 
 ## Overview
 
-This tool automates the gathering of business data (phone, website, ratings, service options) and applies a sophisticated qualification engine to filter leads. It uses the `simple-salesforce` library for CRM interaction and `serpapi` for Google Maps data extraction.
+This tool automates the process of gathering business data (phone, website, ratings, service options) and applies a sophisticated qualification logic to filter leads. It uses a **modular architecture** to separate business logic from the automation workflow.
 
 ## Features
 
-- **Automated Qualification**: Automatically marks leads as `Qualified` or `Disqualified` based on configurable business rules.
-- **Restaurant Standards**:
-    - **Residential Check**: Detects if an address is a private residence without a business listing.
-    - **Service Verification**: Disqualifies Bars/Pubs/Cafes that do not offer delivery services.
-    - **Operational Status**: Automatically disqualifies businesses marked as "Permanently Closed" or "Temporarily Closed" on Google Maps.
-- **Configurable Rules**: All qualification logic is externalized in `qualification_config.json`, allowing non-technical users to update rules (keywords, categories, etc.) easily.
-- **Selective Processing**: Targets only leads that haven't been qualified yet (`Qualification_Status__c = NULL`).
-- **Data Normalization**: Parses complex Google Maps address strings into structured Salesforce fields (Street, City, Postal Code, Country).
-- **Bulk Updates**: Uses the Salesforce Bulk API for high-efficiency record updates.
+- **Automated Qualification Engine**: Categorizes leads as `Qualified` or `Disqualified` based on industry standards.
+- **Cost Optimization**: Includes a "Pre-Enrichment" layer that filters out junk or residential leads *before* making any paid API calls.
+- **Modular Architecture**: 
+    - **Logic Separation**: Parsing and qualification rules are separated from the main execution script.
+    - **External Configuration**: Rules are managed via a simple JSON file.
+- **Restaurant-Specific Logic**: Detects delivery services, residential addresses, and closed business statuses.
+- **Salesforce Bulk Integration**: Efficiently updates records in batches, minimizing CRM overhead.
+
+## Project Structure
+
+- **`lead_enrichment_automation.py`**: The **Orchestrator**. Handles environment setup, Salesforce connections, SerpAPI calls, and the main processing loop.
+- **`logic.py`**: The **Brain**. Contains all data parsing functions, qualification algorithms, and the pre-enrichment filter.
+- **`qualification_config.json`**: The **Ruleset**. A human-editable file where you define categories, keywords, and residential signals.
+- **`LEARNING_RESOURCES.md`**: A guide explaining the advanced Python concepts used in this project.
 
 ## Prerequisites
 
 - **Python 3.12+**
-- **Salesforce Custom Fields**: The following fields must exist on the Lead object:
+- **Salesforce Custom Fields**:
     - `Google_Place_ID__c` (Text)
     - `Qualification_Status__c` (Picklist: Qualified, Disqualified)
     - `Disqualification_Reason__c` (Text/Long Text)
     - `Date_Enriched_At__c` (DateTime)
-- **SerpAPI API Key**: For Google Maps search results.
+- **SerpAPI API Key**: For Google Maps data extraction.
 
-## Setup
+## Setup & Usage
 
 1.  **Clone and Install**:
     ```bash
@@ -38,7 +43,7 @@ This tool automates the gathering of business data (phone, website, ratings, ser
     ```
 
 2.  **Configure Environment**:
-    Create a `.env` file with your credentials:
+    Add your credentials to a `.env` file:
     ```env
     SF_USERNAME=...
     SF_PASSWORD=...
@@ -46,19 +51,11 @@ This tool automates the gathering of business data (phone, website, ratings, ser
     SERP_API=...
     ```
 
-3.  **Adjust Rules**:
-    Edit `qualification_config.json` to customize which business types or keywords trigger disqualification.
+3.  **Run Automation**:
+    ```bash
+    python lead_enrichment_automation.py
+    ```
 
-## Usage
+## Customizing Rules
 
-Run the main automation script:
-```bash
-python lead_enrichment_automation.py
-```
-The script will fetch up to 10 leads (configurable), enrich them, apply qualification logic, and push the updates back to Salesforce.
-
-## Project Structure
-
-- `lead_enrichment_automation.py`: The main automation logic.
-- `qualification_config.json`: Human-editable rules for the qualification engine.
-- `LEARNING_RESOURCES.md`: Deep dive into the Python concepts used here.
+You can modify the qualification logic without touching any Python code by editing `qualification_config.json`. You can add blacklisted types, required delivery keywords, or residential address indicators.
