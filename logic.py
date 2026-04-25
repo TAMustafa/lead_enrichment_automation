@@ -4,12 +4,19 @@ import json
 import logging
 import requests
 import unicodedata
-import re
 import pandas as pd
-from typing import Dict, Any, Optional, List, Tuple, Type
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone
+from rapidfuzz import fuzz
+from serpapi import GoogleSearch
 
 logger = logging.getLogger(__name__)
+
+# Pre-compiled Regex for Performance
+POSTAL_REGEX = re.compile(r'([A-Z]{1,2}[0-9][A-Z0-9]? [0-9][A-Z]{2}|\b\d{4,5}(?:[-\s][A-Z]{1,2})?\b)', re.I)
+
+# Constants
+GENERIC_CUISINE_TYPES = {'restaurant', 'food', 'point_of_interest', 'establishment', 'store', 'meal_takeaway', 'meal_delivery'}
 
 # Load Qualification Rules
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'qualification_config.json')
@@ -34,6 +41,73 @@ def extract_payment_options(place: Dict[str, Any]) -> Optional[str]:
             return ", ".join(item["payments"])
     return None
 
+def extract_opening_hours(place: Dict[str, Any]) -> Optional[str]:
+    hours = place.get("hours")
+    
+    # Handle alternative SerpApi formats just in case
+    if not hours:
+        alt_hours = place.get("operating_hours")
+        if isinstance(alt_hours, dict):
+            hours = [{k: v} for k, v in alt_hours.items()]
+            
+    if not isinstance(hours, list):
+        return None
+        
+    formatted = []
+    for day_entry in hours:
+        if isinstance(day_entry, dict):
+            for day, time_str in day_entry.items():
+                # Shorten day names to save space (e.g., 'monday' -> 'Mon')
+                day_short = day[:3].capitalize()
+                formatted.append(f"{day_short}: {time_str}")
+        
+    result = " | ".join(formatted)
+    return result[:255] if result else None
+
+def extract_cuisines(place: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    raw_types = place.get("type", [])
+    if not isinstance(raw_types, list):
+        raw_types = []
+        
+    cuisines = []
+    for t in raw_types:
+        t_lower = t.lower()
+        if t_lower not in GENERIC_CUISINE_TYPES:
+            # Clean up the string
+            cleaned = t_lower.replace('_restaurant', '').replace(' restaurant', '')
+            cleaned = cleaned.replace('_takeaway', '').replace(' takeaway', '')
+            cleaned = cleaned.replace('_', ' ').title().strip()
+            if cleaned and cleaned not in cuisines:
+                cuisines.append(cleaned)
+                
+    # If we still have nothing, maybe check if it's a cafe, bar, bakery
+    if not cuisines:
+        for t in raw_types:
+            t_lower = t.lower()
+            if t_lower in {'cafe', 'bar', 'pub', 'bakery', 'coffee_shop', 'fast_food'}:
+                cleaned = t_lower.replace('_', ' ').title().strip()
+                if cleaned not in cuisines:
+                    cuisines.append(cleaned)
+                    
+    cuisine_type = ", ".join(cuisines) if cuisines else None
+    primary_cuisine = cuisines[0] if len(cuisines) > 0 else None
+    secondary_cuisine = cuisines[1] if len(cuisines) > 1 else None
+
+    # Truncate to avoid Salesforce STRING_TOO_LONG errors (assuming 15 char limit)
+    if cuisine_type and len(cuisine_type) > 15:
+        # If it's a list, try to just use primary
+        cuisine_type = primary_cuisine[:15] if primary_cuisine else cuisine_type[:15]
+    if primary_cuisine and len(primary_cuisine) > 15:
+        primary_cuisine = primary_cuisine[:15]
+    if secondary_cuisine and len(secondary_cuisine) > 15:
+        secondary_cuisine = secondary_cuisine[:15]
+
+    return {
+        "cuisine_type": cuisine_type,
+        "primary_cuisine": primary_cuisine,
+        "secondary_cuisine": secondary_cuisine
+    }
+
 def extract_address_components(place: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """Parse address components from full address string."""
     full_address = place.get("address", "")
@@ -47,7 +121,7 @@ def extract_address_components(place: Dict[str, Any]) -> Dict[str, Optional[str]
         city_postal_part = parts[-2] if len(parts) > 2 else parts[1]
         
         # Improved Postcode Regex (Supports UK: YO10 4AH, US: 12345, EU: 1234)
-        postal_match = re.search(r'([A-Z]{1,2}[0-9][A-Z0-9]? [0-9][A-Z]{2}|\b\d{4,5}(?:[-\s][A-Z]{1,2})?\b)', city_postal_part, re.I)
+        postal_match = POSTAL_REGEX.search(city_postal_part)
         if postal_match:
             res["postal_code"] = postal_match.group()
             res["city"] = city_postal_part.replace(res["postal_code"], "").strip().strip(',')
@@ -100,11 +174,12 @@ def evaluate_qualification(
 
     # 3. Name Match Check
     if norm_google_name and norm_sf_name:
-        if norm_sf_name not in norm_google_name and norm_google_name not in norm_sf_name:
+        match_score = fuzz.token_set_ratio(norm_sf_name, norm_google_name)
+        if match_score < 75:
             # Exception: if it's a generic establishment type, we might be more lenient, 
             # but usually a name mismatch is a dealbreaker.
             if "establishment" not in norm_types:
-                return "Disqualified", f"Automation Disqualified: Name mismatch (SF: '{sf_company}', Google: '{google_name}')."
+                return "Disqualified", f"Automation Disqualified: Name mismatch (SF: '{sf_company}', Google: '{google_name}', Score: {match_score})."
 
     # 4. Category Blacklist
     blacklisted = QUAL_RULES.get('always_disqualify_types', [])
@@ -163,8 +238,6 @@ class MarketHandler:
 
     def enrich(self, lead_row: pd.Series) -> Optional[Dict[str, Any]]:
         """Enrichment using SerpAPI with fallback logic."""
-        from serpapi import GoogleSearch
-        
         place_id = lead_row.get("Google_Place_ID__c")
         name = lead_row.get("Company") or lead_row.get("Name")
         city = lead_row.get("City")
@@ -211,6 +284,7 @@ class MarketHandler:
     def _process_results(self, place: Dict[str, Any], lead_row: pd.Series) -> Dict[str, Any]:
         """Common logic to parse SerpAPI results."""
         addr = extract_address_components(place)
+        cuisines = extract_cuisines(place)
         data = {
             "google_name": place.get("title"),
             "phone": place.get("phone"),
@@ -221,6 +295,10 @@ class MarketHandler:
             "store_type": extract_store_type(place),
             "service_options": extract_service_options(place),
             "payment_options": extract_payment_options(place),
+            "cuisine_type": cuisines["cuisine_type"],
+            "primary_cuisine": cuisines["primary_cuisine"],
+            "secondary_cuisine": cuisines["secondary_cuisine"],
+            "opening_hours": extract_opening_hours(place),
             **addr,
             "full_address": place.get("address"),
             "raw_types": place.get("type", []),
@@ -258,7 +336,7 @@ class UKMarketHandler(MarketHandler):
                     # Look for the best match in results
                     match = establishments[0]
                     for e in establishments:
-                        if normalize_string(raw_name) in normalize_string(e.get("BusinessName")):
+                        if fuzz.token_set_ratio(normalize_string(raw_name), normalize_string(e.get("BusinessName"))) >= 80:
                             match = e
                             break
                             
@@ -277,8 +355,10 @@ class UKMarketHandler(MarketHandler):
                     logger.info(f"FSA data found for {raw_name}")
                 else:
                     logger.info(f"No FSA data found for {search_name} in {postcode}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"FSA API request error: {e}")
         except Exception as e:
-            logger.error(f"FSA error: {e}")
+            logger.error(f"FSA parsing error: {e}")
             
         return data
 

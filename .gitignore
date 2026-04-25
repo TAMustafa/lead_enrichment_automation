@@ -6,3 +6,4 @@ __pycache__
 .DS_Store
 .python-version
 LEARNING_RESOURCES.md
+scratch.py

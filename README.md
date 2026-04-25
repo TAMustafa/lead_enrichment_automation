@@ -1,13 +1,14 @@
 # Lead Enrichment & Qualification Automation
 
-A professional Python-based automation tool designed to enrich Salesforce Lead records with detailed business information and automatically qualify or disqualify them using a rule-based engine.
+A Python-based automation tool designed to enrich Salesforce Lead records with detailed business information and automatically qualify or disqualify them using a rule-based engine.
 
-## 🌟 New Features: Multi-Market & UK Hygiene
-
+## 🌟 New Features: Speed & Intelligence
+- **High-Speed Concurrency**: Uses `ThreadPoolExecutor` to process API requests asynchronously, dropping execution time from minutes to seconds.
+- **Advanced Cuisine Categorization**: Automatically extracts, cleans, and categorizes generic Google Maps tags into `Primary_Cuisine` and `Secondary_Cuisine` fields.
+- **Fuzzy String Matching**: Integrated `rapidfuzz` to handle slight variations in business names (e.g., "Totò's" matching "Toto's"), drastically reducing false negatives during data validation.
+- **Operating Hours Parsing**: Dynamically formats Google Maps operating hours into a Salesforce-friendly compact string.
 - **International Market Support**: Now supports **UK, NL, DE, AT, CH, and BE** with a scalable Market Handler architecture.
 - **UK Food Hygiene Enrichment**: Automatically fetches **FSA (Food Standards Agency)** ratings, inspection agencies, and official URLs for UK leads.
-- **Strict Location Verification**: Uses a "Ground Truth" check comparing Salesforce address data with Google results to prevent brand mix-ups.
-- **Smart Name Normalization**: Handles accents and special characters (e.g., "Totò's" matches "Toto's") to improve identification accuracy.
 
 ## 🚀 Key Features
 
@@ -31,6 +32,8 @@ A professional Python-based automation tool designed to enrich Salesforce Lead r
 - **Salesforce Custom Fields**:
     - `Google_Place_ID__c` (Text)
     - `Qualification_Status__c` (Picklist: Qualified, Disqualified)
+    - `Cuisine_Type__c`, `Primary_Cuisine__c`, `Secondary_Cuisine__c` (Text)
+    - `Opening_Hours__c` (Long Text Area)
     - `FSA_AGENCY__c` (Text)
     - `FSA_RATING__c` (Picklist: ZERO, ONE, TWO, THREE, FOUR, FIVE)
     - `FSA_URL__c` (URL)

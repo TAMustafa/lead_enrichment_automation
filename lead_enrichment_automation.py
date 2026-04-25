@@ -5,7 +5,7 @@ import pandas as pd
 from typing import Dict, Any, Optional
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
-from serpapi import GoogleSearch
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from simple_salesforce import Salesforce
 
 # Import modularized logic
@@ -47,27 +47,28 @@ try:
     SELECT Id, Company, Name, Phone, Website, Street, City, PostalCode, Country, 
            Google_Place_ID__c, Store_Type__c, Price_Range__c, Google_Rating__c, 
            Service_Options__c, Payment_Options__c, Status, Qualification_Status__c,
-           FSA_AGENCY__c, FSA_RATING__c, FSA_URL__c
+           FSA_AGENCY__c, FSA_RATING__c, FSA_URL__c,
+           Cuisine_Type__c, Primary_Cuisine__c, Secondary_Cuisine__c, Opening_Hours__c
     FROM Lead
-    WHERE Google_Place_ID__c != NULL 
-    AND Qualification_Status__c = NULL
+    WHERE Google_Place_ID__c != NULL AND Qualification_Status__c = NULL
     """
-    leads = sf.query(query)['records']
+    leads = sf.query_all(query)['records']
     df = pd.DataFrame(leads).drop(columns=['attributes'], errors='ignore')
-    logger.info(f"Retrieved {len(df)} leads to enrich")
+    logger.info(f"Retrieved {len(df)} leads from Salesforce")
 except Exception as e:
     logger.error(f"Salesforce operation failed: {e}")
     raise
 
 # Process Enrichment with Merge Logic
 preview_rows = []
-for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
+
+def process_lead(row):
     try:
         # 1. Pre-Qualification Check (FREE)
         is_pre_qualified, pre_reason = pre_qualify_lead(row)
         
         if not is_pre_qualified:
-            logger.info(f"Lead {row['Name']} disqualified early (Saving Credits): {pre_reason}")
+            logger.info(f"Lead {row.get('Name')} disqualified early (Saving Credits): {pre_reason}")
             merged = {
                 "Id": row["Id"],
                 "Qualification_Status__c": "Disqualified",
@@ -75,15 +76,14 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
                 "Status": "Disqualified",
                 "Date_Enriched_At__c": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
-            preview_rows.append(merged)
-            continue
+            return merged
 
         # 2. Enrichment (Handlers manage both SerpAPI and Market-specific data)
         handler = MarketFactory.get_handler(row.get("Country"), SERP_API)
         data = handler.enrich(row)
         if data:
             # Merge logic: Only fill fields that are empty in Salesforce
-            merged = {"Id": row["Id"], "Name": row["Name"]}
+            merged = {"Id": row["Id"], "Name": row.get("Name")}
             field_map = {
                 "Phone": "phone", "Website": "website", "Store_Type__c": "store_type",
                 "Price_Range__c": "price_range", "Google_Rating__c": "rating", 
@@ -91,7 +91,11 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
                 "Payment_Options__c": "payment_options", "Street": "street", 
                 "City": "city", "PostalCode": "postal_code", "Country": "country",
                 "FSA_AGENCY__c": "FSA_AGENCY", "FSA_RATING__c": "FSA_RATING", 
-                "FSA_URL__c": "FSA_URL"
+                "FSA_URL__c": "FSA_URL",
+                "Cuisine_Type__c": "cuisine_type",
+                "Primary_Cuisine__c": "primary_cuisine",
+                "Secondary_Cuisine__c": "secondary_cuisine",
+                "Opening_Hours__c": "opening_hours"
             }
             for sf_field, google_key in field_map.items():
                 val = row.get(sf_field)
@@ -102,7 +106,7 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
             
             # Apply Qualification Logic with Strict Address Check
             status, reason = evaluate_qualification(
-                sf_company=row['Company'],
+                sf_company=row.get('Company', ''),
                 google_name=data.get("google_name"),
                 types=data["raw_types"], 
                 service_options=data["raw_service_options"],
@@ -118,21 +122,44 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
             if reason:
                 merged["Disqualification_Reason__c"] = reason[:255]
                 merged["Status"] = "Disqualified"
-                logger.info(f"Lead {row['Name']} disqualified: {reason}")
+                logger.info(f"Lead {row.get('Name')} disqualified: {reason}")
             else:
                 merged["Status"] = "Qualified"
-                logger.info(f"Lead {row['Name']} qualified")
+                logger.info(f"Lead {row.get('Name')} qualified")
 
             merged.update({
                 "Date_Enriched_At__c": datetime.datetime.now(datetime.timezone.utc).isoformat()
             })
-            preview_rows.append(merged)
+            return merged
         else:
-            logger.warning(f"Skipping {row['Name']} - No enrichment data found")
+            logger.warning(f"Skipping {row.get('Name')} - No enrichment data found")
+            return None
             
     except Exception as e:
         logger.error(f"Failed to process lead {row.get('Name')} ({row.get('Id')}): {e}")
-        continue
+        return None
+
+# Filter leads in Python since Salesforce SOQL can't filter Long Text Area fields
+records_to_process = []
+for row in df.to_dict('records'):
+    needs_qualification = pd.isna(row.get('Qualification_Status__c')) or not row.get('Qualification_Status__c')
+    needs_cuisine = pd.isna(row.get('Cuisine_Type__c')) or not row.get('Cuisine_Type__c')
+    needs_hours = pd.isna(row.get('Opening_Hours__c')) or not row.get('Opening_Hours__c')
+    
+    if needs_qualification or needs_cuisine or needs_hours:
+        # Skip if already disqualified (no need to waste credits fetching hours)
+        if row.get('Qualification_Status__c') == 'Disqualified':
+            continue
+        records_to_process.append(row)
+
+logger.info(f"Filtering complete: {len(records_to_process)} leads actually need enrichment.")
+
+with ThreadPoolExecutor(max_workers=10) as executor:
+    futures = {executor.submit(process_lead, row): row for row in records_to_process}
+    for future in tqdm(as_completed(futures), total=len(records_to_process), desc="Enriching Leads"):
+        res = future.result()
+        if res:
+            preview_rows.append(res)
 
 # Update Salesforce
 if not (preview_df := pd.DataFrame(preview_rows)).empty:
