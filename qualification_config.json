@@ -1,0 +1,41 @@
+{
+  "rules": {
+    "require_delivery_for_types": [
+      "bar",
+      "pub",
+      "cafe",
+      "coffee_shop",
+      "coffee",
+      "juice_shop",
+      "night_club",
+      "liquor_store"
+    ],
+    "require_delivery_for_name_keywords": [
+      "cafe",
+      "coffee",
+      "bar",
+      "pub",
+      "nightclub"
+    ],
+    "always_disqualify_types": [
+      "school",
+      "university",
+      "government_office",
+      "place_of_worship",
+      "hospital",
+      "doctor",
+      "dentist",
+      "pharmacy",
+      "lodging",
+      "hotel"
+    ],
+    "residential_signals": [
+      "premise",
+      "subpremise"
+    ],
+    "residential_exception_types": [
+      "establishment",
+      "point_of_interest"
+    ]
+  }
+}
