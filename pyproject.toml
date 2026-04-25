@@ -1,7 +1,7 @@
 [project]
 name = "lead-enrichment-automation"
 version = "0.1.0"
-description = "Add your description here"
+description = "Enrich Salesforce Lead records with Google Maps data and automatically qualify or disqualify them using a configurable rule engine."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

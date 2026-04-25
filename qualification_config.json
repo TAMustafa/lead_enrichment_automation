@@ -55,6 +55,17 @@
         "floor",
         "suite"
       ]
-    }
+    },
+    "cuisine_keywords": [
+      "Italian", "Mexican", "Chinese", "Japanese", "Indian", "Thai", "French",
+      "Spanish", "Greek", "Mediterranean", "Middle Eastern", "Korean", "Vietnamese",
+      "American", "British", "Pizza", "Burger", "Sushi", "Seafood", "Vegan",
+      "Vegetarian", "BBQ", "Steakhouse", "Turkish", "Lebanese", "Caribbean",
+      "Persian", "Moroccan", "Filipino", "Indonesian", "Brazilian", "Halal",
+      "Pakistani", "Bangladeshi", "Sri Lankan", "Nepalese", "Afghani",
+      "Ethiopian", "West African", "Jamaican", "Cuban", "Peruvian",
+      "Portuguese", "Russian", "Polish", "Hungarian", "Romanian",
+      "Dim Sum", "Ramen", "Pho", "Tapas", "Mezze", "Fusion"
+    ]
   }
 }

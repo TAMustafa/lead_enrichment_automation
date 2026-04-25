@@ -2,7 +2,6 @@ import os
 import datetime
 import logging
 import pandas as pd
-from typing import Dict, Any, Optional
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,12 +9,10 @@ from simple_salesforce import Salesforce
 
 # Import modularized logic
 from logic import (
-    extract_store_type,
-    extract_service_options,
-    extract_payment_options,
-    extract_address_components,
     evaluate_qualification,
     pre_qualify_lead,
+    sanitize_string,
+    safe_isna,
     MarketFactory
 )
 
@@ -37,20 +34,22 @@ if missing := [v for v in required if not os.getenv(v)]:
     raise ValueError(f"Missing environment variables: {', '.join(missing)}")
 logger.info("Configuration loaded successfully")
 
-# --- Functions moved to logic.py (MarketHandler) ---
-
 # Connect to Salesforce and Query Leads
 try:
     sf = Salesforce(username=SF_USERNAME, password=SF_PASSWORD, security_token=SF_TOKEN)
     logger.info("Connected to Salesforce")
+    # query_all automatically handles SOQL pagination (multiple REST pages),
+    # so very large record sets are retrieved correctly without manual offset logic.
     query = """
-    SELECT Id, Company, Name, Phone, Website, Street, City, PostalCode, Country, 
-           Google_Place_ID__c, Store_Type__c, Price_Range__c, Google_Rating__c, 
-           Service_Options__c, Payment_Options__c, Status, Qualification_Status__c,
+    SELECT Id, Company, Name, Phone, Website, Street, City, PostalCode, Country,
+           Google_Place_ID__c, Store_Type__c, Price_Range__c, Google_Rating__c,
+           Google_Reviews__c, Service_Options__c, Payment_Options__c, Status, Qualification_Status__c,
            FSA_AGENCY__c, FSA_RATING__c, FSA_URL__c,
            Cuisine_Type__c, Primary_Cuisine__c, Secondary_Cuisine__c, Opening_Hours__c
     FROM Lead
-    WHERE Google_Place_ID__c != NULL AND Qualification_Status__c = NULL
+    WHERE (Google_Place_ID__c != NULL 
+    AND Qualification_Status__c = NULL)
+    OR (Phone = NULL AND Google_Place_ID__c != NULL)
     """
     leads = sf.query_all(query)['records']
     df = pd.DataFrame(leads).drop(columns=['attributes'], errors='ignore')
@@ -84,6 +83,13 @@ def process_lead(row):
         if data:
             # Merge logic: Only fill fields that are empty in Salesforce
             merged = {"Id": row["Id"], "Name": row.get("Name")}
+            # Text fields that should be sanitized before writing to Salesforce
+            text_fields = {
+                "Phone", "Website", "Store_Type__c", "Service_Options__c",
+                "Payment_Options__c", "Street", "City", "PostalCode", "Country",
+                "FSA_AGENCY__c", "FSA_URL__c", "Cuisine_Type__c",
+                "Primary_Cuisine__c", "Secondary_Cuisine__c", "Disqualification_Reason__c",
+            }
             field_map = {
                 "Phone": "phone", "Website": "website", "Store_Type__c": "store_type",
                 "Price_Range__c": "price_range", "Google_Rating__c": "rating", 
@@ -99,10 +105,11 @@ def process_lead(row):
             }
             for sf_field, google_key in field_map.items():
                 val = row.get(sf_field)
-                if pd.isna(val) or not val:
-                    merged[sf_field] = data.get(google_key)
+                if safe_isna(val) or not val:
+                    raw_val = data.get(google_key)
+                    merged[sf_field] = sanitize_string(raw_val) if sf_field in text_fields else raw_val
                 else:
-                    merged[sf_field] = val # Keep original
+                    merged[sf_field] = val  # Keep original
             
             # Apply Qualification Logic with Strict Address Check
             status, reason = evaluate_qualification(
@@ -136,17 +143,18 @@ def process_lead(row):
             return None
             
     except Exception as e:
-        logger.error(f"Failed to process lead {row.get('Name')} ({row.get('Id')}): {e}")
+        logger.exception(f"Failed to process lead {row.get('Name')} ({row.get('Id')}): {e}")
         return None
 
 # Filter leads in Python since Salesforce SOQL can't filter Long Text Area fields
 records_to_process = []
 for row in df.to_dict('records'):
-    needs_qualification = pd.isna(row.get('Qualification_Status__c')) or not row.get('Qualification_Status__c')
-    needs_cuisine = pd.isna(row.get('Cuisine_Type__c')) or not row.get('Cuisine_Type__c')
-    needs_hours = pd.isna(row.get('Opening_Hours__c')) or not row.get('Opening_Hours__c')
-    
-    if needs_qualification or needs_cuisine or needs_hours:
+    needs_qualification = safe_isna(row.get('Qualification_Status__c')) or not row.get('Qualification_Status__c')
+    needs_cuisine = safe_isna(row.get('Cuisine_Type__c')) or not row.get('Cuisine_Type__c')
+    needs_hours = safe_isna(row.get('Opening_Hours__c')) or not row.get('Opening_Hours__c')
+    needs_phone = safe_isna(row.get('Phone')) or not row.get('Phone')
+
+    if needs_qualification or needs_cuisine or needs_hours or needs_phone:
         # Skip if already disqualified (no need to waste credits fetching hours)
         if row.get('Qualification_Status__c') == 'Disqualified':
             continue
