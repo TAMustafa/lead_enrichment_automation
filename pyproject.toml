@@ -8,6 +8,7 @@ dependencies = [
     "google-search-results>=2.4.2",
     "pandas>=3.0.2",
     "python-dotenv>=1.2.2",
+    "requests",
     "simple-salesforce>=1.12.9",
     "tqdm>=4.67.3",
 ]

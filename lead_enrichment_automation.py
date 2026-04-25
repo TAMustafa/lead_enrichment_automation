@@ -15,7 +15,8 @@ from logic import (
     extract_payment_options,
     extract_address_components,
     evaluate_qualification,
-    pre_qualify_lead
+    pre_qualify_lead,
+    MarketFactory
 )
 
 # Setup logging
@@ -36,41 +37,7 @@ if missing := [v for v in required if not os.getenv(v)]:
     raise ValueError(f"Missing environment variables: {', '.join(missing)}")
 logger.info("Configuration loaded successfully")
 
-def enrich_with_serpapi(place_id: Optional[str] = None, name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Enrich lead data using SerpAPI Google Maps search."""
-    if not place_id and not name: raise ValueError("Either place_id or name must be provided")
-    params = {"engine": "google_maps", "api_key": SERP_API}
-    if place_id: params["place_id"] = place_id
-    else: params["q"] = name
-    
-    try:
-        results = GoogleSearch(params).get_dict()
-        place = results.get("place_results", {})
-        if not place:
-            logger.warning(f"No results for {place_id or name}")
-            return None
-            
-        addr = extract_address_components(place)
-        return {
-            "google_name": place.get("title"),
-            "phone": place.get("phone"),
-            "website": place.get("website"),
-            "rating": place.get("rating"),
-            "reviews": place.get("reviews"),
-            "price_range": place.get("price"),
-            "store_type": extract_store_type(place),
-            "service_options": extract_service_options(place),
-            "payment_options": extract_payment_options(place),
-            **addr,
-            "full_address": place.get("address"),
-            "raw_types": place.get("type", []),
-            "raw_service_options": place.get("service_options", {}),
-            "business_status": place.get("business_status"),
-            "permanently_closed": place.get("permanently_closed", False)
-        }
-    except Exception as e:
-        logger.error(f"Error enriching {place_id or name}: {e}")
-        return None
+# --- Functions moved to logic.py (MarketHandler) ---
 
 # Connect to Salesforce and Query Leads
 try:
@@ -79,11 +46,11 @@ try:
     query = """
     SELECT Id, Company, Name, Phone, Website, Street, City, PostalCode, Country, 
            Google_Place_ID__c, Store_Type__c, Price_Range__c, Google_Rating__c, 
-           Service_Options__c, Payment_Options__c, Status, Qualification_Status__c
+           Service_Options__c, Payment_Options__c, Status, Qualification_Status__c,
+           FSA_AGENCY__c, FSA_RATING__c, FSA_URL__c
     FROM Lead
     WHERE Google_Place_ID__c != NULL 
     AND Qualification_Status__c = NULL
-    LIMIT 10
     """
     leads = sf.query(query)['records']
     df = pd.DataFrame(leads).drop(columns=['attributes'], errors='ignore')
@@ -111,8 +78,9 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
             preview_rows.append(merged)
             continue
 
-        # 2. Enrichment (PAID - Costs 1 Credit)
-        data = enrich_with_serpapi(place_id=row.get("Google_Place_ID__c"), name=row.get("Name"))
+        # 2. Enrichment (Handlers manage both SerpAPI and Market-specific data)
+        handler = MarketFactory.get_handler(row.get("Country"), SERP_API)
+        data = handler.enrich(row)
         if data:
             # Merge logic: Only fill fields that are empty in Salesforce
             merged = {"Id": row["Id"], "Name": row["Name"]}
@@ -121,7 +89,9 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
                 "Price_Range__c": "price_range", "Google_Rating__c": "rating", 
                 "Google_Reviews__c": "reviews", "Service_Options__c": "service_options",
                 "Payment_Options__c": "payment_options", "Street": "street", 
-                "City": "city", "PostalCode": "postal_code", "Country": "country"
+                "City": "city", "PostalCode": "postal_code", "Country": "country",
+                "FSA_AGENCY__c": "FSA_AGENCY", "FSA_RATING__c": "FSA_RATING", 
+                "FSA_URL__c": "FSA_URL"
             }
             for sf_field, google_key in field_map.items():
                 val = row.get(sf_field)
@@ -130,14 +100,17 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
                 else:
                     merged[sf_field] = val # Keep original
             
-            # Apply Qualification Logic
+            # Apply Qualification Logic with Strict Address Check
             status, reason = evaluate_qualification(
                 sf_company=row['Company'],
                 google_name=data.get("google_name"),
                 types=data["raw_types"], 
                 service_options=data["raw_service_options"],
                 business_status=data.get("business_status"),
-                permanently_closed=data.get("permanently_closed", False)
+                permanently_closed=data.get("permanently_closed", False),
+                sf_street=row.get("Street"),
+                sf_postcode=row.get("PostalCode"),
+                google_address=data.get("full_address")
             )
             
             # Update Salesforce Custom Fields
@@ -174,6 +147,8 @@ if not (preview_df := pd.DataFrame(preview_rows)).empty:
         successes = [r for r in results if r["success"]]
         failures = [r for r in results if not r["success"]]
         logger.info(f"Update complete: {len(successes)} successful, {len(failures)} failed")
+        for f in failures:
+            logger.error(f"Failed to update record: {f.get('errors')}")
     except Exception as e:
         logger.error(f"Bulk update failed: {e}")
 else:
