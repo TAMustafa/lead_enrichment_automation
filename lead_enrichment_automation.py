@@ -132,7 +132,7 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
             
             # Apply Qualification Logic
             status, reason = evaluate_qualification(
-                sf_name=row['Name'],
+                sf_company=row['Company'],
                 google_name=data.get("google_name"),
                 types=data["raw_types"], 
                 service_options=data["raw_service_options"],
@@ -163,7 +163,9 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Leads"):
 
 # Update Salesforce
 if not (preview_df := pd.DataFrame(preview_rows)).empty:
-    records = preview_df.to_dict('records')
+    # Clean data: Replace NaN with None (Salesforce doesn't accept NaN in JSON)
+    records = preview_df.replace({pd.NA: None, float('nan'): None}).to_dict('records')
+    
     for r in records: r.pop('Name', None) # Id is enough for update
     
     try:

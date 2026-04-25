@@ -49,9 +49,9 @@ def extract_address_components(place: Dict[str, Any]) -> Dict[str, Optional[str]
             res["city"] = city_postal_part
     return res
 
-def evaluate_qualification(sf_name: str, google_name: Optional[str], types: List[str], service_options: Dict[str, Any], business_status: Optional[str] = None, permanently_closed: bool = False) -> Tuple[str, Optional[str]]:
+def evaluate_qualification(sf_company: str, google_name: Optional[str], types: List[str], service_options: Dict[str, Any], business_status: Optional[str] = None, permanently_closed: bool = False) -> Tuple[str, Optional[str]]:
     """Qualification logic based on Restaurant standards defined in config."""
-    combined_name = f"{sf_name} {google_name or ''}".lower()
+    combined_name = f"{sf_company} {google_name or ''}".lower()
     norm_types = [t.lower() for t in types]
     
     if permanently_closed or business_status == "CLOSED_PERMANENTLY":
@@ -64,9 +64,9 @@ def evaluate_qualification(sf_name: str, google_name: Optional[str], types: List
         return "Disqualified", "Automation Disqualified: Result is a generic address point, not a business listing."
 
     if google_name:
-        s_name, g_name = sf_name.lower().strip(), google_name.lower().strip()
-        if s_name not in g_name and g_name not in s_name and "establishment" not in norm_types:
-            return "Disqualified", f"Automation Disqualified: Name mismatch (SF: '{sf_name}', Google: '{google_name}')."
+        s_comp, g_name = sf_company.lower().strip(), google_name.lower().strip()
+        if s_comp not in g_name and g_name not in s_comp and "establishment" not in norm_types:
+            return "Disqualified", f"Automation Disqualified: Name mismatch (SF Company: '{sf_company}', Google: '{google_name}')."
 
     blacklisted = QUAL_RULES.get('always_disqualify_types', [])
     for t in norm_types:
