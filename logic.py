@@ -135,7 +135,7 @@ def _load_market_config(
         logger.warning(f"Market config file not found at '{path}'. Using built-in defaults.")
         return market_countries, competitor_platforms
 
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
     if not isinstance(raw, dict):
@@ -359,7 +359,7 @@ def _load_and_validate_config(path: str) -> Dict[str, Any]:
         logger.warning(f"Config file not found at '{path}'. Using built-in defaults.")
         return _CONFIG_DEFAULTS.copy()
 
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         raw = json.load(f)
 
     rules = raw.get('rules')
@@ -612,8 +612,8 @@ def fetch_menu_and_determine_cuisine(menu_link: Optional[str], website: Optional
                 cuisine = determine_cuisine_from_text(_extract_visible_text(res.text))
                 if cuisine:
                     return cuisine
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Failed to fetch cuisine from {url}: {exc}")
     return None
 
 # Salesforce Long Text Area fields can hold up to 32,768 characters.
@@ -900,7 +900,7 @@ def evaluate_qualification(
         
     return "Qualified", None
 
-def pre_qualify_lead(row: pd.Series) -> Tuple[bool, Optional[str]]:
+def pre_qualify_lead(row: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """Perform 'free' checks on Salesforce data before spending API credits."""
     rules = QUAL_RULES.get('pre_qualification_rules', {})
     combined_name = f"{row.get('Name', '')} {row.get('Company', '')}".lower()
@@ -927,7 +927,7 @@ class MarketHandler:
         canonical = _canonical_country_code(self.country_code)
         return _COUNTRY_GL_MAP.get(canonical, "us")
 
-    def enrich(self, lead_row: pd.Series) -> Optional[Dict[str, Any]]:
+    def enrich(self, lead_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Enrichment using SerpAPI with two strategies:
 
         1. Place ID lookup (exact — preferred when Google_Place_ID__c is set)
@@ -1022,7 +1022,7 @@ class MarketHandler:
 
         return None
 
-    def _process_results(self, place: Dict[str, Any], lead_row: pd.Series) -> Dict[str, Any]:
+    def _process_results(self, place: Dict[str, Any], lead_row: Dict[str, Any]) -> Dict[str, Any]:
         """Common logic to parse SerpAPI results."""
         addr = extract_address_components(place)
         address_component_types = extract_address_component_types(place)
@@ -1050,7 +1050,7 @@ class MarketHandler:
         }
         return self.post_enrich(data, lead_row)
 
-    def post_enrich(self, data: Dict[str, Any], lead_row: pd.Series) -> Dict[str, Any]:
+    def post_enrich(self, data: Dict[str, Any], lead_row: Dict[str, Any]) -> Dict[str, Any]:
         """Hook for market-specific extra steps. Base implementation adds competitor links."""
         business_name = data.get("google_name") or lead_row.get("Company") or ""
         if business_name:
@@ -1126,7 +1126,7 @@ class UKMarketHandler(MarketHandler):
 
         return establishments
 
-    def post_enrich(self, data: Dict[str, Any], lead_row: pd.Series) -> Dict[str, Any]:
+    def post_enrich(self, data: Dict[str, Any], lead_row: Dict[str, Any]) -> Dict[str, Any]:
         # Run base enrichment first (adds competitor links)
         data = super().post_enrich(data, lead_row)
 

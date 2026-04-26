@@ -102,7 +102,11 @@ preview_rows = []
 
 def _is_missing(value) -> bool:
     """Return True when value is empty/NA and should be backfilled."""
-    return safe_isna(value) or not value
+    if safe_isna(value):
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
 
 def process_lead(row):
     try:
