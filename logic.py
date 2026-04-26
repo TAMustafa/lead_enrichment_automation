@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import threading
+from copy import deepcopy
 import unicodedata
 import requests
 import pandas as pd
@@ -13,6 +14,15 @@ from serpapi import GoogleSearch
 
 logger = logging.getLogger(__name__)
 
+# --- Optional: DuckDuckGo free search for competitor links ---
+try:
+    from ddgs import DDGS as _DDGS
+    _DDG_AVAILABLE = True
+except ImportError:
+    _DDGS = None  # type: ignore[assignment]
+    _DDG_AVAILABLE = False
+    logger.warning("ddgs not installed — competitor link search disabled. Run: uv add ddgs")
+
 # --- Shared HTTP session for connection pooling ---
 # Reusing a single Session across all requests avoids the overhead of
 # creating a new TCP connection per call (relevant for FSA + menu scraping).
@@ -21,6 +31,263 @@ _http_session.headers.update({"User-Agent": "Mozilla/5.0"})
 
 # --- FSA API base URL (single place to update if the URL ever changes) ---
 FSA_API_BASE = "https://api.ratings.food.gov.uk"
+
+# --- DuckDuckGo rate-limit guard ---
+# Cap concurrent DDG calls to 3 even when the main executor runs 10 threads.
+_ddg_semaphore = threading.Semaphore(3)
+_DDG_SLEEP: float = 0.4  # seconds to pause after acquiring the semaphore
+
+# --- Competitor platforms per country (Just Eat owns Thuisbezorgd & Lieferando — excluded) ---
+# Keys in the returned dict map directly to Salesforce custom field names (without __c suffix).
+# NOTE: You must create these custom fields in Salesforce before the first run:
+#   Uber_Eats_URL__c  (URL, length 255)
+#   Deliveroo_URL__c  (URL, length 255)
+_DEFAULT_MARKET_COUNTRIES: Dict[str, Dict[str, List[str] | str]] = {
+    "UK": {
+        "gl": "uk",
+        "aliases": ["UK", "GB", "UNITED KINGDOM", "GREAT BRITAIN"],
+    },
+    "NL": {
+        "gl": "nl",
+        "aliases": ["NL", "NETHERLANDS"],
+    },
+    "DE": {
+        "gl": "de",
+        "aliases": ["DE", "GERMANY"],
+    },
+    "AT": {
+        "gl": "at",
+        "aliases": ["AT", "AUSTRIA"],
+    },
+    "CH": {
+        "gl": "ch",
+        "aliases": ["CH", "SWITZERLAND"],
+    },
+    "BE": {
+        "gl": "be",
+        "aliases": ["BE", "BELGIUM"],
+    },
+    "US": {
+        "gl": "us",
+        "aliases": ["US", "UNITED STATES"],
+    },
+}
+
+
+def _build_country_lookup_maps(
+    market_countries: Dict[str, Dict[str, List[str] | str]],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Build alias and GL maps from canonical market country metadata."""
+    aliases: Dict[str, str] = {}
+    gl_map: Dict[str, str] = {}
+
+    for canonical, meta in market_countries.items():
+        canonical_norm = str(canonical).upper().strip()
+        gl_value = str(meta.get("gl", "us")).lower().strip()
+        if canonical_norm:
+            gl_map[canonical_norm] = gl_value or "us"
+
+        raw_aliases = meta.get("aliases", [])
+        if isinstance(raw_aliases, list):
+            for alias in raw_aliases:
+                alias_norm = str(alias).upper().strip()
+                if alias_norm:
+                    aliases[alias_norm] = canonical_norm
+
+        if canonical_norm:
+            aliases[canonical_norm] = canonical_norm
+
+    if "US" not in gl_map:
+        gl_map["US"] = "us"
+    aliases.setdefault("US", "US")
+    return aliases, gl_map
+
+
+def _is_valid_market_country_entry(entry: Any) -> bool:
+    """Return True when one market country row has required keys/types."""
+    if not isinstance(entry, dict):
+        return False
+    gl = entry.get("gl")
+    aliases = entry.get("aliases")
+    if not isinstance(gl, str) or not gl.strip():
+        return False
+    if not isinstance(aliases, list) or not aliases:
+        return False
+    return all(isinstance(a, str) and a.strip() for a in aliases)
+
+
+def _is_valid_competitor_platform_entry(entry: Any) -> bool:
+    """Return True when one competitor platform row has required keys/types."""
+    if not isinstance(entry, dict):
+        return False
+    required_keys = ("name", "key", "site")
+    return all(isinstance(entry.get(k), str) and entry.get(k).strip() for k in required_keys)
+
+
+def _load_market_config(
+    path: str,
+) -> Tuple[Dict[str, Dict[str, List[str] | str]], Dict[str, List[Dict[str, str]]]]:
+    """Load market_config.json with validation and merge onto built-in defaults."""
+    market_countries = deepcopy(_DEFAULT_MARKET_COUNTRIES)
+    competitor_platforms = deepcopy(_DEFAULT_COMPETITOR_PLATFORMS)
+
+    if not os.path.exists(path):
+        logger.warning(f"Market config file not found at '{path}'. Using built-in defaults.")
+        return market_countries, competitor_platforms
+
+    with open(path, "r") as f:
+        raw = json.load(f)
+
+    if not isinstance(raw, dict):
+        raise ValueError("market_config.json must be a top-level object")
+
+    raw_countries = raw.get("market_countries")
+    if isinstance(raw_countries, dict):
+        for canonical, meta in raw_countries.items():
+            canonical_norm = str(canonical).upper().strip()
+            if canonical_norm and _is_valid_market_country_entry(meta):
+                market_countries[canonical_norm] = {
+                    "gl": str(meta["gl"]).lower().strip(),
+                    "aliases": [str(a).upper().strip() for a in meta["aliases"] if str(a).strip()],
+                }
+            else:
+                logger.warning(f"Skipping invalid market country entry for '{canonical}'.")
+
+    alias_lookup, _ = _build_country_lookup_maps(market_countries)
+
+    raw_platforms = raw.get("competitor_platforms")
+    if isinstance(raw_platforms, dict):
+        for country_key, entries in raw_platforms.items():
+            country_norm = str(country_key).upper().strip()
+            canonical = alias_lookup.get(country_norm, country_norm)
+            if not isinstance(entries, list):
+                logger.warning(f"Skipping invalid competitor platforms list for '{country_key}'.")
+                continue
+
+            normalized_entries: List[Dict[str, str]] = []
+            for entry in entries:
+                if _is_valid_competitor_platform_entry(entry):
+                    normalized_entries.append(
+                        {
+                            "name": str(entry["name"]).strip(),
+                            "key": str(entry["key"]).strip(),
+                            "site": str(entry["site"]).strip(),
+                        }
+                    )
+                else:
+                    logger.warning(f"Skipping invalid competitor platform entry for '{country_key}'.")
+
+            if normalized_entries:
+                competitor_platforms[canonical] = normalized_entries
+
+    return market_countries, competitor_platforms
+
+_MARKET_COUNTRIES: Dict[str, Dict[str, List[str] | str]] = deepcopy(_DEFAULT_MARKET_COUNTRIES)
+
+_COUNTRY_ALIASES: Dict[str, str] = {
+    alias: canonical
+    for canonical, meta in _MARKET_COUNTRIES.items()
+    for alias in meta["aliases"]
+}
+_COUNTRY_GL_MAP: Dict[str, str] = {
+    canonical: str(meta["gl"])
+    for canonical, meta in _MARKET_COUNTRIES.items()
+}
+
+
+def _canonical_country_code(country: Optional[str]) -> str:
+    """Resolve country aliases to supported canonical 2-letter codes."""
+    norm = str(country or "US").upper().strip()
+    return _COUNTRY_ALIASES.get(norm, norm)
+
+
+def _get_known_cuisines() -> List[str]:
+    """Return configured cuisine list or built-in fallback."""
+    return QUAL_RULES.get("cuisine_keywords") or _BUILTIN_CUISINES
+
+
+def _normalize_cuisine_key(value: str) -> str:
+    """Normalize cuisine labels for robust comparisons."""
+    return re.sub(r'\s+', ' ', normalize_string(value)).strip()
+
+
+def _build_cuisine_lookup(cuisines: List[str]) -> Dict[str, str]:
+    """Map normalized cuisine variants to canonical labels."""
+    lookup: Dict[str, str] = {}
+    for cuisine in cuisines:
+        key = _normalize_cuisine_key(cuisine)
+        if key:
+            lookup[key] = cuisine
+    return lookup
+
+
+def _clean_google_type_label(value: str) -> str:
+    """Normalize Google Maps type labels / IDs into display-friendly text."""
+    lowered = value.lower().replace('_', ' ').strip()
+    suffixes = [" restaurant", " takeaway", " food", " cuisine", " place"]
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if lowered.endswith(suffix):
+                lowered = lowered[:-len(suffix)].strip()
+                changed = True
+    lowered = re.sub(r'\s+', ' ', lowered).strip()
+    return lowered.title()
+
+
+def _match_known_cuisine(
+    candidates: List[str],
+    cuisine_lookup: Dict[str, str],
+) -> Optional[str]:
+    """Return canonical cuisine for the best matching candidate."""
+    for candidate in candidates:
+        key = _normalize_cuisine_key(candidate)
+        if key and key in cuisine_lookup:
+            return cuisine_lookup[key]
+    return None
+
+
+def _extract_visible_text(html: str) -> str:
+    """Strip HTML/script/style noise before keyword cuisine detection."""
+    text = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.I | re.S)
+    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.I | re.S)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    return re.sub(r'\s+', ' ', text)
+
+
+_DEFAULT_COMPETITOR_PLATFORMS: Dict[str, List[Dict[str, str]]] = {
+    # UK: both Uber Eats and Deliveroo are active
+    "UK": [
+        {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+        {"name": "Deliveroo",  "key": "deliveroo_url",  "site": "deliveroo.co.uk"},
+    ],
+    # NL: Deliveroo exited in 2022 — Uber Eats only
+    "NL": [
+        {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+    ],
+    # DE: Deliveroo exited — Uber Eats only
+    "DE": [
+        {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+    ],
+    # AT: Uber Eats only
+    "AT": [
+        {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+    ],
+    # BE: both active
+    "BE": [
+        {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+        {"name": "Deliveroo",  "key": "deliveroo_url",  "site": "deliveroo.be"},
+    ],
+    # CH: Uber Eats only
+    "CH": [
+        {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+    ],
+    # US: Uber Eats only (DoorDash has no public-index restaurant pages suitable for site: filter)
+    "US": [
+        {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+    ],
+}
 
 # --- Thread-safe FSA response cache ---
 # Key: (normalized_name, postcode) → list[establishment dicts]
@@ -33,6 +300,28 @@ POSTAL_REGEX = re.compile(r'([A-Z]{1,2}[0-9][A-Z0-9]? [0-9][A-Z]{2}|\b\d{4,5}(?:
 
 # Constants
 GENERIC_CUISINE_TYPES = {'restaurant', 'food', 'point_of_interest', 'establishment', 'store', 'meal_takeaway', 'meal_delivery'}
+
+# Meal-period / service-style type IDs that describe *when* food is served, not its culinary origin.
+# These are deprioritised so that ethnic cuisine types (turkish_restaurant, italian_restaurant …)
+# always win when both are present on a Google Maps listing.
+_MEAL_TYPE_IDS: set = {
+    'breakfast_restaurant', 'brunch_restaurant', 'lunch_restaurant',
+    'dinner_restaurant', 'fast_food_restaurant', 'buffet_restaurant',
+    'sandwich_shop', 'ice_cream_shop', 'dessert_restaurant', 'dessert_shop',
+    'snack_bar', 'diner',
+}
+# Venue type IDs used as last resort when no recognised cuisine is found
+_VENUE_TYPE_IDS: set = {'cafe', 'bar', 'pub', 'bakery', 'coffee_shop', 'fast_food'}
+
+# Known cuisine keywords — the single source of truth for what counts as a valid cuisine.
+# Add new cuisines here or override via qualification_config.json → rules.cuisine_keywords.
+_BUILTIN_CUISINES: List[str] = [
+    "Italian", "Mexican", "Chinese", "Japanese", "Indian", "Thai", "French",
+    "Spanish", "Greek", "Mediterranean", "Middle Eastern", "Korean", "Vietnamese",
+    "American", "British", "Pizza", "Burger", "Sushi", "Seafood", "Vegan",
+    "Vegetarian", "BBQ", "Steakhouse", "Turkish", "Lebanese", "Caribbean",
+    "Persian", "Moroccan", "Filipino", "Indonesian", "Brazilian", "Halal",
+]
 
 # Minimum fuzzy score (0–100) required to accept a name match from local_results or FSA.
 # Scores below this mean the result is too different from the Salesforce Company name.
@@ -110,6 +399,106 @@ except Exception as e:
     logger.error(f"Failed to load qualification rules: {e}")
     QUAL_RULES = _CONFIG_DEFAULTS.copy()
 
+
+# Load Market Rules
+MARKET_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'market_config.json')
+try:
+    _MARKET_COUNTRIES, _COMPETITOR_PLATFORMS = _load_market_config(MARKET_CONFIG_PATH)
+except Exception as e:
+    logger.error(f"Failed to load market rules: {e}")
+    _MARKET_COUNTRIES = deepcopy(_DEFAULT_MARKET_COUNTRIES)
+    _COMPETITOR_PLATFORMS = deepcopy(_DEFAULT_COMPETITOR_PLATFORMS)
+
+_COUNTRY_ALIASES, _COUNTRY_GL_MAP = _build_country_lookup_maps(_MARKET_COUNTRIES)
+
+def search_competitor_links(
+    business_name: str,
+    city: Optional[str],
+    postcode: Optional[str],
+    country_code: str,
+) -> Dict[str, Optional[str]]:
+    """Search DuckDuckGo for competitor platform listings for a given business.
+
+    Uses ``site:`` filter queries (e.g. ``site:ubereats.com``) combined with the
+    business name and location.  No API key is required — DuckDuckGo is free.
+    A threading semaphore caps concurrent calls to avoid triggering rate limits.
+
+    Args:
+        business_name: Restaurant / business name to look up.
+        city: City name for narrowing the search (used if postcode is absent).
+        postcode: Postcode for narrowing the search.
+        country_code: Raw country code from the lead (e.g. "UK", "GB", "NL").
+
+    Returns:
+        Dict mapping platform keys (``uber_eats_url``, ``deliveroo_url``, …) to
+        the best-matching URL string or ``None`` when not found.
+
+    Note:
+        Thuisbezorgd and Lieferando are Just Eat brands and are intentionally
+        excluded from the competitor list.
+    """
+    if not _DDG_AVAILABLE or not business_name:
+        return {}
+
+    # Normalise country code to the canonical key used in _COMPETITOR_PLATFORMS
+    country_norm = _canonical_country_code(country_code)
+    platforms = _COMPETITOR_PLATFORMS.get(country_norm, _COMPETITOR_PLATFORMS.get("US", []))
+
+    # Pre-initialise all expected keys so callers always see a consistent shape
+    found: Dict[str, Optional[str]] = {p["key"]: None for p in platforms}
+
+    norm_name = normalize_string(business_name)
+
+    for platform in platforms:
+        site = platform["site"]
+        key  = platform["key"]
+        name = platform["name"]
+
+        # Build candidate queries: precise (with postcode) first, then city-only fallback.
+        # Uber Eats / Deliveroo pages often don't surface the postcode in indexed text,
+        # so the city-only query is the more reliable signal.
+        queries: List[str] = []
+        if postcode:
+            queries.append(f'site:{site} "{business_name}" "{postcode}"')
+        if city and city != postcode:
+            queries.append(f'site:{site} "{business_name}" "{city}"')
+        queries.append(f'site:{site} "{business_name}"')  # bare fallback
+
+        for query in queries:
+            if found[key]:  # already resolved by a previous attempt
+                break
+            try:
+                with _ddg_semaphore:
+                    time.sleep(_DDG_SLEEP)
+                    raw_results = list(_DDGS().text(query, max_results=3))
+
+                for r in raw_results or []:
+                    url = r.get("href", "")
+                    if not url or site not in url:
+                        continue
+
+                    # Validate: strip platform suffix from title, then fuzzy-match
+                    title = r.get("title", "")
+                    cleaned_title = re.sub(r'\s*[\|\u2013\u2014\-].*$', '', title).strip()
+                    score = max(
+                        fuzz.token_set_ratio(norm_name, normalize_string(cleaned_title)),
+                        fuzz.partial_ratio(norm_name, normalize_string(cleaned_title)),
+                    )
+                    if score >= 45:
+                        found[key] = url
+                        logger.debug(f"{name} link found for '{business_name}' (query='{query}'): {url} (score={score})")
+                        break
+
+            except Exception as exc:
+                logger.warning(f"DDG competitor search failed for '{business_name}' on {name}: {exc}")
+                break  # don't retry on exception
+
+        if not found[key]:
+            logger.debug(f"No {name} listing found for '{business_name}'")
+
+    return found
+
+
 def _serpapi_fetch_with_retry(search_params: dict, retries: int = 3, delay: float = 1.5) -> dict:
     """Call SerpAPI with exponential-backoff retry on rate-limit errors.
 
@@ -131,6 +520,33 @@ def _serpapi_fetch_with_retry(search_params: dict, retries: int = 3, delay: floa
     return {}
 
 
+def extract_address_component_types(place: Dict[str, Any]) -> List[str]:
+    """Extract normalized Google address component type identifiers.
+
+    SerpAPI may expose `address_components` as a list of dicts where each item
+    contains a `types` list. These type IDs are used by residential signals in
+    qualification config (e.g. `subpremise`, `street_address`).
+    """
+    components = place.get("address_components")
+    if not isinstance(components, list):
+        return []
+
+    collected: List[str] = []
+    for comp in components:
+        if not isinstance(comp, dict):
+            continue
+        comp_types = comp.get("types")
+        if not isinstance(comp_types, list):
+            continue
+        for comp_type in comp_types:
+            if not comp_type:
+                continue
+            t = str(comp_type).lower().strip()
+            if t and t not in collected:
+                collected.append(t)
+    return collected
+
+
 def extract_store_type(place: Dict[str, Any]) -> Optional[str]:
     types = place.get("type", [])
     return ", ".join(types) if isinstance(types, list) else None
@@ -149,30 +565,27 @@ def determine_cuisine_from_text(text: str) -> Optional[str]:
     """Scan text for cuisine keywords and return the most-mentioned one.
 
     The keyword list is loaded from qualification_config.json under
-    ``rules.cuisine_keywords``. The built-in list below is the fallback
+    ``rules.cuisine_keywords``. The built-in list is the fallback
     used when the config key is absent, so no code change is needed to
     add new cuisines — just edit the JSON file.
     """
-    _BUILTIN_CUISINES = [
-        "Italian", "Mexican", "Chinese", "Japanese", "Indian", "Thai", "French",
-        "Spanish", "Greek", "Mediterranean", "Middle Eastern", "Korean", "Vietnamese",
-        "American", "British", "Pizza", "Burger", "Sushi", "Seafood", "Vegan",
-        "Vegetarian", "BBQ", "Steakhouse", "Turkish", "Lebanese", "Caribbean",
-        "Persian", "Moroccan", "Filipino", "Indonesian", "Brazilian", "Halal",
-    ]
-    # QUAL_RULES may not be populated yet when this module is first loaded
-    # (circular dependency risk), so we read it lazily at call time.
-    cuisines: List[str] = QUAL_RULES.get("cuisine_keywords") or _BUILTIN_CUISINES
+    cuisines = _get_known_cuisines()
+    cuisine_lookup = _build_cuisine_lookup(cuisines)
+    text_normalized = _normalize_cuisine_key(text)
+    if not text_normalized:
+        return None
 
-    text_lower = text.lower()
     counts: Dict[str, int] = {}
-    for c in cuisines:
-        count = text_lower.count(c.lower())
-        if count > 0:
-            counts[c] = count
+    for key, canonical in cuisine_lookup.items():
+        if not key:
+            continue
+        pattern = rf'\b{re.escape(key)}\b'
+        matches = re.findall(pattern, text_normalized)
+        if matches:
+            counts[canonical] = counts.get(canonical, 0) + len(matches)
 
     if counts:
-        return sorted(counts.items(), key=lambda x: x[1], reverse=True)[0][0]
+        return max(counts.items(), key=lambda item: item[1])[0]
     return None
 
 def sanitize_string(value: Any, max_length: int = 255) -> Optional[str]:
@@ -196,7 +609,7 @@ def fetch_menu_and_determine_cuisine(menu_link: Optional[str], website: Optional
         try:
             res = _http_session.get(url, timeout=5)
             if res.status_code == 200:
-                cuisine = determine_cuisine_from_text(res.text)
+                cuisine = determine_cuisine_from_text(_extract_visible_text(res.text))
                 if cuisine:
                     return cuisine
         except Exception:
@@ -252,19 +665,47 @@ def extract_cuisines(place: Dict[str, Any]) -> Dict[str, Optional[str]]:
     else:
         type_pairs = [(t.lower().replace(' ', '_'), t) for t in raw_type_names]
 
-    cuisines = []
-    for type_id, display_name in type_pairs:
-        if type_id.lower() not in GENERIC_CUISINE_TYPES:
-            cleaned = display_name.lower()
-            cleaned = cleaned.replace('_restaurant', '').replace(' restaurant', '')
-            cleaned = cleaned.replace('_takeaway', '').replace(' takeaway', '')
-            cleaned = cleaned.replace('_', ' ').title().strip()
-            if cleaned and cleaned not in cuisines:
-                cuisines.append(cleaned)
+    known_cuisines = _get_known_cuisines()
+    cuisine_lookup = _build_cuisine_lookup(known_cuisines)
+    known_lower: set = {c.lower() for c in known_cuisines}
 
-    # If nothing found, check for generic venue type IDs (cafe, bar, bakery …)
+    # Classify each Google Maps type into one of three buckets (priority high → low):
+    #   confirmed  — type name matches a known cuisine keyword (e.g. Turkish, Italian)
+    #   other      — non-generic, non-meal-period type that is NOT a known cuisine (e.g. Family)
+    #   meal_types — describes when food is served, not what cuisine it is (e.g. Breakfast)
+    confirmed: List[str] = []
+    other: List[str] = []
+    meal_types: List[str] = []
+    for type_id, display_name in type_pairs:
+        tid = type_id.lower()
+        if tid in GENERIC_CUISINE_TYPES:
+            continue
+        cleaned_display = _clean_google_type_label(display_name)
+        cleaned_id = _clean_google_type_label(type_id)
+        cleaned = cleaned_display or cleaned_id
+        if not cleaned:
+            continue
+
+        matched_cuisine = _match_known_cuisine(
+            candidates=[cleaned_display, cleaned_id, display_name, type_id],
+            cuisine_lookup=cuisine_lookup,
+        )
+
+        if matched_cuisine:
+            if matched_cuisine not in confirmed:
+                confirmed.append(matched_cuisine)
+        elif tid in _MEAL_TYPE_IDS:
+            if cleaned not in meal_types:
+                meal_types.append(cleaned)
+        else:
+            if cleaned not in other:
+                other.append(cleaned)
+
+    # Use highest-priority non-empty bucket
+    cuisines = confirmed or other or meal_types
+
+    # Last resort: venue type IDs (cafe, bar, bakery …) when all buckets are empty
     if not cuisines:
-        _VENUE_TYPE_IDS = {'cafe', 'bar', 'pub', 'bakery', 'coffee_shop', 'fast_food'}
         for type_id, display_name in type_pairs:
             if type_id.lower() in _VENUE_TYPE_IDS:
                 cleaned = display_name.replace('_', ' ').title().strip()
@@ -278,20 +719,22 @@ def extract_cuisines(place: Dict[str, Any]) -> Dict[str, Optional[str]]:
     menu_link = place.get("menu_link") or place.get("menu", {}).get("link")
     website = place.get("website")
 
-    # Only scrape if primary_cuisine is missing or extremely generic
-    if not primary_cuisine or primary_cuisine.lower() in {'food', 'store', 'point of interest', 'establishment'}:
+    # Scrape when primary is absent OR is not a recognised cuisine keyword.
+    # This catches vague types like "Family" or "International" that slip through
+    # when Google Maps has no explicit ethnic cuisine type.
+    if not primary_cuisine or primary_cuisine.lower() not in known_lower:
         scraped_cuisine = fetch_menu_and_determine_cuisine(menu_link, website)
         if scraped_cuisine:
             primary_cuisine = scraped_cuisine
             if scraped_cuisine not in cuisines:
                 cuisines.insert(0, scraped_cuisine)
 
-    cuisine_type = ", ".join(cuisines) if cuisines else None
+    # Recompute secondary from the final cuisines list — scraping may have shifted positions
+    secondary_cuisine = cuisines[1] if len(cuisines) > 1 else None
 
     return {
-        "cuisine_type": cuisine_type[:255] if cuisine_type else None,
         "primary_cuisine": primary_cuisine[:255] if primary_cuisine else None,
-        "secondary_cuisine": secondary_cuisine[:255] if secondary_cuisine else None
+        "secondary_cuisine": secondary_cuisine[:255] if secondary_cuisine else None,
     }
 
 def safe_isna(val: Any) -> bool:
@@ -373,12 +816,15 @@ def evaluate_qualification(
     permanently_closed: bool = False,
     sf_street: Optional[str] = None,
     sf_postcode: Optional[str] = None,
-    google_address: Optional[str] = None
+    google_address: Optional[str] = None,
+    address_component_types: Optional[List[str]] = None,
 ) -> Tuple[str, Optional[str]]:
     """Qualification logic with strict Name and Address verification."""
     norm_sf_name = normalize_string(sf_company)
     norm_google_name = normalize_string(google_name)
     norm_types = [t.lower() for t in types]
+    norm_address_component_types = [str(t).lower() for t in (address_component_types or []) if t]
+    service_options = service_options if isinstance(service_options, dict) else {}
     
     # 1. Closed Status Check
     if permanently_closed or business_status == "CLOSED_PERMANENTLY":
@@ -432,7 +878,15 @@ def evaluate_qualification(
     # 5. Residential Check
     res_signals = QUAL_RULES.get('residential_signals', [])
     res_exceptions = QUAL_RULES.get('residential_exception_types', [])
-    if any(s in norm_types for s in res_signals) and not any(e in norm_types for e in res_exceptions):
+    has_residential_signal = any(
+        signal in norm_types or signal in norm_address_component_types
+        for signal in res_signals
+    )
+    has_exception = any(
+        ex in norm_types or ex in norm_address_component_types
+        for ex in res_exceptions
+    )
+    if has_residential_signal and not has_exception:
         return "Disqualified", "Automation Disqualified: Residential Address detected."
     
     # 6. Service Delivery Check
@@ -470,13 +924,8 @@ class MarketHandler:
         
     def _get_gl(self) -> str:
         """Map country variations to 2-letter GL code for SerpAPI."""
-        mapping = {
-            "UK": "uk", "GB": "uk", "UNITED KINGDOM": "uk", "GREAT BRITAIN": "uk",
-            "DE": "de", "GERMANY": "de", "NL": "nl", "NETHERLANDS": "nl",
-            "BE": "be", "BELGIUM": "be", "AT": "at", "AUSTRIA": "at",
-            "CH": "ch", "SWITZERLAND": "ch", "US": "us", "UNITED STATES": "us"
-        }
-        return mapping.get(self.country_code.upper(), "us")
+        canonical = _canonical_country_code(self.country_code)
+        return _COUNTRY_GL_MAP.get(canonical, "us")
 
     def enrich(self, lead_row: pd.Series) -> Optional[Dict[str, Any]]:
         """Enrichment using SerpAPI with two strategies:
@@ -576,6 +1025,7 @@ class MarketHandler:
     def _process_results(self, place: Dict[str, Any], lead_row: pd.Series) -> Dict[str, Any]:
         """Common logic to parse SerpAPI results."""
         addr = extract_address_components(place)
+        address_component_types = extract_address_component_types(place)
         cuisines = extract_cuisines(place)
         data = {
             "google_name": place.get("title"),
@@ -587,12 +1037,12 @@ class MarketHandler:
             "store_type": extract_store_type(place),
             "service_options": extract_service_options(place),
             "payment_options": extract_payment_options(place),
-            "cuisine_type": cuisines["cuisine_type"],
             "primary_cuisine": cuisines["primary_cuisine"],
             "secondary_cuisine": cuisines["secondary_cuisine"],
             "opening_hours": extract_opening_hours(place),
             **addr,
             "full_address": place.get("address"),
+            "raw_address_component_types": address_component_types,
             "raw_types": place.get("type_ids", place.get("type", [])),  # prefer IDs for qualification checks
             "raw_service_options": place.get("service_options", {}),
             "business_status": place.get("business_status"),
@@ -601,7 +1051,16 @@ class MarketHandler:
         return self.post_enrich(data, lead_row)
 
     def post_enrich(self, data: Dict[str, Any], lead_row: pd.Series) -> Dict[str, Any]:
-        """Hook for market-specific extra steps."""
+        """Hook for market-specific extra steps. Base implementation adds competitor links."""
+        business_name = data.get("google_name") or lead_row.get("Company") or ""
+        if business_name:
+            competitor_links = search_competitor_links(
+                business_name=business_name,
+                city=data.get("city") or lead_row.get("City"),
+                postcode=data.get("postal_code") or lead_row.get("PostalCode"),
+                country_code=self.country_code,
+            )
+            data.update(competitor_links)
         return data
 
 class UKMarketHandler(MarketHandler):
@@ -668,6 +1127,9 @@ class UKMarketHandler(MarketHandler):
         return establishments
 
     def post_enrich(self, data: Dict[str, Any], lead_row: pd.Series) -> Dict[str, Any]:
+        # Run base enrichment first (adds competitor links)
+        data = super().post_enrich(data, lead_row)
+
         raw_name = data.get("google_name") or lead_row.get("Company")
         postcode = data.get("postal_code") or lead_row.get("PostalCode")
 
@@ -733,19 +1195,10 @@ class UKMarketHandler(MarketHandler):
 
 class MarketFactory:
     """Factory to return the appropriate MarketHandler."""
-    
-    # Map multiple aliases to the same handler class
-    _MAPPING = {
-        UKMarketHandler: ["UK", "GB", "UNITED KINGDOM", "GREAT BRITAIN"],
-        MarketHandler: ["NL", "NETHERLANDS", "DE", "GERMANY", "AT", "AUSTRIA", "CH", "SWITZERLAND", "BE", "BELGIUM", "US"]
-    }
-    
+
     @classmethod
     def get_handler(cls, country: Optional[str], api_key: str) -> MarketHandler:
-        country_norm = str(country or "US").upper().strip()
-        
-        for handler_class, aliases in cls._MAPPING.items():
-            if country_norm in aliases:
-                return handler_class(country_norm, api_key)
-        
-        return MarketHandler("DEFAULT", api_key)
+        country_norm = _canonical_country_code(country)
+        if country_norm == "UK":
+            return UKMarketHandler(country_norm, api_key)
+        return MarketHandler(country_norm, api_key)

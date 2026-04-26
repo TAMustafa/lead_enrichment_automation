@@ -1,0 +1,57 @@
+{
+  "market_countries": {
+    "UK": {
+      "gl": "uk",
+      "aliases": ["UK", "GB", "UNITED KINGDOM", "GREAT BRITAIN"]
+    },
+    "NL": {
+      "gl": "nl",
+      "aliases": ["NL", "NETHERLANDS"]
+    },
+    "DE": {
+      "gl": "de",
+      "aliases": ["DE", "GERMANY"]
+    },
+    "AT": {
+      "gl": "at",
+      "aliases": ["AT", "AUSTRIA"]
+    },
+    "CH": {
+      "gl": "ch",
+      "aliases": ["CH", "SWITZERLAND"]
+    },
+    "BE": {
+      "gl": "be",
+      "aliases": ["BE", "BELGIUM"]
+    },
+    "US": {
+      "gl": "us",
+      "aliases": ["US", "UNITED STATES"]
+    }
+  },
+  "competitor_platforms": {
+    "UK": [
+      {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+      {"name": "Deliveroo", "key": "deliveroo_url", "site": "deliveroo.co.uk"}
+    ],
+    "NL": [
+      {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"}
+    ],
+    "DE": [
+      {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"}
+    ],
+    "AT": [
+      {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"}
+    ],
+    "BE": [
+      {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"},
+      {"name": "Deliveroo", "key": "deliveroo_url", "site": "deliveroo.be"}
+    ],
+    "CH": [
+      {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"}
+    ],
+    "US": [
+      {"name": "Uber Eats", "key": "uber_eats_url", "site": "ubereats.com"}
+    ]
+  }
+}
