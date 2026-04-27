@@ -6,6 +6,7 @@ A Python-based automation tool that enriches Salesforce Lead records with Google
 
 - **Pre-Enrichment Filter**: Screens out junk and residential leads from Salesforce data *before* spending any API credits.
 - **Google Maps Enrichment**: Fetches phone, website, rating, reviews, price range, service options, payment options, opening hours, and address components via SerpAPI.
+- **E.164 Phone Normalization**: Normalizes enriched phone numbers to international E.164 format (`+442079460958`) using `phonenumbers`, falling back gracefully on unparseable values.
 - **Cuisine Categorisation**: Uses a multi-stage cuisine detector that prioritizes explicit cuisine types from Google Maps and falls back to menu/website text analysis when types are generic.
 - **Fuzzy Name & Address Matching**: Uses `rapidfuzz` to tolerate minor spelling variations (e.g. "Totò's" → "Toto's") during business identity verification and FSA lookups.
 - **Strict Qualification Engine**: Multi-step pipeline — closure status → address verification → name match → category blacklist → residential check → delivery requirement — each step producing an actionable disqualification reason.
@@ -139,6 +140,7 @@ Python 3.12 or later.
 | `Primary_Cuisine__c` | Text | Top cuisine |
 | `Secondary_Cuisine__c` | Text | Second cuisine |
 | `Opening_Hours__c` | Long Text Area (32 768) | Compact formatted hours |
+| `Phone` (standard) | Phone | Stored in E.164 format when normalization succeeds |
 | `FSA_AGENCY__c` | Text | UK only — local authority name |
 | `FSA_RATING__c` | Picklist | UK only — `ZERO` … `FIVE` |
 | `FSA_URL__c` | URL | UK only — FSA business page |
@@ -182,10 +184,12 @@ The script queries leads where `Google_Place_ID__c != NULL` and either qualifica
 ## 🧠 Merge & Data Safety Notes
 
 - Existing Salesforce values are preserved by default.
-- Only empty Salesforce fields are backfilled from enrichment output.
+- Only empty Salesforce fields are backfilled from enrichment output (numeric `0` is treated as a real value, not as missing).
 - Text fields are sanitized (control characters removed, trimmed to field-safe lengths).
+- Phone numbers from Google Maps are normalized to E.164 (`+CCXXXXXXXXX`) using the lead's `Country` to infer the region. If parsing fails, the original (sanitized) value is kept.
 - Competitor URLs are only written when a non-empty URL is found.
 - `Opening_Hours__c` is treated as Long Text Area and supports up to 32,768 chars.
+- The standard `Status` field is **not** written by the automation. Qualification state is tracked exclusively on `Qualification_Status__c`, so existing sales workflow values (e.g. `Working - Contacted`) are never overwritten on re-enrichment.
 
 ## ⚙️ Configuration (`qualification_config.json`)
 
@@ -194,15 +198,17 @@ All qualification behaviour is controlled by `rules` keys in `qualification_conf
 | Key | Type | Effect |
 |-----|------|--------|
 | `require_delivery_for_types` | list[str] | Disqualify these place types unless delivery is enabled |
-| `require_delivery_for_name_keywords` | list[str] | Same check triggered by business name keywords |
+| `require_delivery_for_name_keywords` | list[str] | Same check triggered by business name keywords (whole-word match) |
 | `always_disqualify_types` | list[str] | Unconditionally disqualify these place types |
 | `residential_signals` | list[str] | Google address component types that indicate a residential address |
 | `residential_exception_types` | list[str] | Override residential disqualification for these types |
-| `pre_qualification_rules.disqualify_name_keywords` | list[str] | Free pre-filter on Salesforce name/company |
-| `pre_qualification_rules.disqualify_address_keywords` | list[str] | Free pre-filter on Salesforce street address |
+| `pre_qualification_rules.disqualify_name_keywords` | list[str] | Free pre-filter on Salesforce name/company (whole-word match) |
+| `pre_qualification_rules.disqualify_address_keywords` | list[str] | Free pre-filter on Salesforce street address (whole-word match) |
 | `cuisine_keywords` | list[str] | Canonical cuisine vocabulary used for both Google-type matching and menu/website fallback detection |
 
-## � Market Configuration (`market_config.json`)
+> **Keyword matching note:** all `*_name_keywords` / `*_address_keywords` lists use **word-boundary** matching, so e.g. `"bar"` only matches the whole word `bar` and will not falsely match `Barbara's Pizzeria` or `Greatest Pizzas`.
+
+## 🌐 Market Configuration (`market_config.json`)
 
 Market routing and competitor scraping inputs are configured in `market_config.json`:
 

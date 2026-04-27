@@ -8,6 +8,7 @@ from copy import deepcopy
 import unicodedata
 import requests
 import pandas as pd
+import phonenumbers
 from typing import Dict, Any, Optional, List, Tuple
 from rapidfuzz import fuzz
 from serpapi import GoogleSearch
@@ -199,11 +200,6 @@ def _canonical_country_code(country: Optional[str]) -> str:
     """Resolve country aliases to supported canonical 2-letter codes."""
     norm = str(country or "US").upper().strip()
     return _COUNTRY_ALIASES.get(norm, norm)
-
-
-def _get_known_cuisines() -> List[str]:
-    """Return configured cuisine list or built-in fallback."""
-    return QUAL_RULES.get("cuisine_keywords") or _BUILTIN_CUISINES
 
 
 def _normalize_cuisine_key(value: str) -> str:
@@ -411,6 +407,7 @@ except Exception as e:
 
 _COUNTRY_ALIASES, _COUNTRY_GL_MAP = _build_country_lookup_maps(_MARKET_COUNTRIES)
 
+
 def search_competitor_links(
     business_name: str,
     city: Optional[str],
@@ -480,10 +477,7 @@ def search_competitor_links(
                     # Validate: strip platform suffix from title, then fuzzy-match
                     title = r.get("title", "")
                     cleaned_title = re.sub(r'\s*[\|\u2013\u2014\-].*$', '', title).strip()
-                    score = max(
-                        fuzz.token_set_ratio(norm_name, normalize_string(cleaned_title)),
-                        fuzz.partial_ratio(norm_name, normalize_string(cleaned_title)),
-                    )
+                    score = _best_fuzzy_score(norm_name, normalize_string(cleaned_title))
                     if score >= 45:
                         found[key] = url
                         logger.debug(f"{name} link found for '{business_name}' (query='{query}'): {url} (score={score})")
@@ -569,14 +563,12 @@ def determine_cuisine_from_text(text: str) -> Optional[str]:
     used when the config key is absent, so no code change is needed to
     add new cuisines — just edit the JSON file.
     """
-    cuisines = _get_known_cuisines()
-    cuisine_lookup = _build_cuisine_lookup(cuisines)
     text_normalized = _normalize_cuisine_key(text)
     if not text_normalized:
         return None
 
     counts: Dict[str, int] = {}
-    for key, canonical in cuisine_lookup.items():
+    for key, canonical in _CUISINE_LOOKUP.items():
         if not key:
             continue
         pattern = rf'\b{re.escape(key)}\b'
@@ -587,6 +579,40 @@ def determine_cuisine_from_text(text: str) -> Optional[str]:
     if counts:
         return max(counts.items(), key=lambda item: item[1])[0]
     return None
+
+# --- Phone normalization ---
+# Map our canonical market keys to ISO 3166-1 alpha-2 region codes used by libphonenumber.
+# Most of our codes are already valid ISO codes; only "UK" needs to be mapped to "GB".
+_PHONE_REGION_MAP: Dict[str, str] = {"UK": "GB"}
+
+
+def normalize_phone(raw: Optional[str], country_code: Optional[str]) -> Optional[str]:
+    """Normalize a phone number to E.164 format (e.g. ``+442079460958``).
+
+    Falls back to the original (sanitized) string if parsing fails or the number
+    is not valid for the inferred region — never raises. This prevents enrichment
+    from being blocked by an unusual Google Maps phone format while still giving
+    downstream tools (dialers, dedup) a clean canonical value when possible.
+
+    Args:
+        raw: Phone number string from Google Maps / SerpAPI.
+        country_code: Lead country (any alias supported by ``_canonical_country_code``).
+    """
+    if not raw or not str(raw).strip():
+        return None
+
+    canonical = _canonical_country_code(country_code)
+    region = _PHONE_REGION_MAP.get(canonical, canonical or None)
+    try:
+        parsed = phonenumbers.parse(str(raw), region)
+        if phonenumbers.is_valid_number(parsed):
+            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+    except phonenumbers.NumberParseException as exc:
+        logger.debug(f"Phone parse failed for '{raw}' (region={region}): {exc}")
+
+    # Fallback: return the raw value cleaned of control chars / whitespace
+    return sanitize_string(raw)
+
 
 def sanitize_string(value: Any, max_length: int = 255) -> Optional[str]:
     """Strip control characters, collapse whitespace, and truncate for Salesforce text fields."""
@@ -665,9 +691,8 @@ def extract_cuisines(place: Dict[str, Any]) -> Dict[str, Optional[str]]:
     else:
         type_pairs = [(t.lower().replace(' ', '_'), t) for t in raw_type_names]
 
-    known_cuisines = _get_known_cuisines()
-    cuisine_lookup = _build_cuisine_lookup(known_cuisines)
-    known_lower: set = {c.lower() for c in known_cuisines}
+    cuisine_lookup = _CUISINE_LOOKUP
+    known_lower = _KNOWN_CUISINES_LOWER
 
     # Classify each Google Maps type into one of three buckets (priority high → low):
     #   confirmed  — type name matches a known cuisine keyword (e.g. Turkish, Italian)
@@ -807,6 +832,33 @@ def normalize_string(s: str) -> str:
     s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
     return re.sub(r'[^a-z0-9\s]', '', s)
 
+
+# --- Cuisine lookup constants ---
+# Built once at import time from QUAL_RULES; previously rebuilt on every call to
+# extract_cuisines() / determine_cuisine_from_text(), which is wasteful since the
+# config never changes during a run. Defined here (after normalize_string) because
+# _build_cuisine_lookup transitively depends on normalize_string.
+_KNOWN_CUISINES: List[str] = QUAL_RULES.get("cuisine_keywords") or _BUILTIN_CUISINES
+_CUISINE_LOOKUP: Dict[str, str] = _build_cuisine_lookup(_KNOWN_CUISINES)
+_KNOWN_CUISINES_LOWER: set = {c.lower() for c in _KNOWN_CUISINES}
+
+
+def _best_fuzzy_score(a: str, b: str) -> int:
+    """Return the higher of token_set_ratio and partial_ratio for two strings.
+
+    These two scoring strategies catch complementary failure modes:
+        * ``token_set_ratio`` handles word reordering and extra/missing tokens
+          (e.g. "Toto's Pizza Restaurant" vs "Toto's Pizza").
+        * ``partial_ratio`` handles substrings and abbreviations
+          (e.g. "123 Main St" inside "123 Main Street, London").
+
+    Taking ``max`` of the two makes name/address matching tolerant of either
+    kind of variance, which is the pattern used everywhere fuzzy matching is
+    applied in this module (qualification name check, address check, FSA
+    match, competitor URL validation, local-result selection).
+    """
+    return max(fuzz.token_set_ratio(a, b), fuzz.partial_ratio(a, b))
+
 def evaluate_qualification(
     sf_company: str, 
     google_name: Optional[str], 
@@ -842,10 +894,9 @@ def evaluate_qualification(
         # Fuzzy match for street
         street_match = False
         if norm_sf_street:
-            # partial_ratio is good because '123 main st' is a substring of '123 main street'
-            match_score = max(fuzz.partial_ratio(norm_sf_street, norm_google_addr), 
-                              fuzz.token_set_ratio(norm_sf_street, norm_google_addr))
-            if match_score > 75:
+            # partial_ratio handles '123 main st' inside '123 main street';
+            # token_set_ratio handles word reordering / extra tokens.
+            if _best_fuzzy_score(norm_sf_street, norm_google_addr) > 75:
                 street_match = True
                 
         # Substring or Fuzzy match for postcode
@@ -859,10 +910,7 @@ def evaluate_qualification(
 
     # 3. Name Match Check
     if norm_google_name and norm_sf_name:
-        match_score = max(
-            fuzz.token_set_ratio(norm_sf_name, norm_google_name),
-            fuzz.partial_ratio(norm_sf_name, norm_google_name)
-        )
+        match_score = _best_fuzzy_score(norm_sf_name, norm_google_name)
         if match_score < 75:
             # Exception: if it's a generic establishment type, we might be more lenient, 
             # but usually a name mismatch is a dealbreaker.
@@ -893,7 +941,13 @@ def evaluate_qualification(
     req_types = QUAL_RULES.get('require_delivery_for_types', [])
     req_keywords = QUAL_RULES.get('require_delivery_for_name_keywords', [])
     combined_name = f"{sf_company} {google_name or ''}".lower()
-    is_target = any(t in norm_types for t in req_types) or any(k in combined_name for k in req_keywords)
+    # Word-boundary match avoids false positives where short keywords like
+    # 'bar' / 'pub' appear inside legitimate restaurant names
+    # (e.g. 'Barbara's Pizzeria' lowercased contains 'bar' as a substring).
+    name_keyword_hit = any(
+        re.search(rf'\b{re.escape(k)}\b', combined_name) for k in req_keywords
+    )
+    is_target = any(t in norm_types for t in req_types) or name_keyword_hit
     
     if is_target and service_options.get("delivery") is False:
         return "Disqualified", "Automation Disqualified: Bar/Cafe/Pub without delivery service."
@@ -905,12 +959,15 @@ def pre_qualify_lead(row: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     rules = QUAL_RULES.get('pre_qualification_rules', {})
     combined_name = f"{row.get('Name', '')} {row.get('Company', '')}".lower()
     for kw in rules.get('disqualify_name_keywords', []):
-        if kw in combined_name:
+        # Word-boundary match: avoid false positives where short keywords like
+        # "test"/"fake"/"sample" are substrings of legitimate restaurant names
+        # (e.g. "Tasty Test Kitchen", "Greatest Pizzas", "Fakhri Mahmood").
+        if re.search(rf'\b{re.escape(kw)}\b', combined_name):
             return False, f"Pre-Enrichment Disqualified: Junk keyword '{kw}' detected."
-            
+
     street = str(row.get('Street', '')).lower()
     for kw in rules.get('disqualify_address_keywords', []):
-        if re.search(rf'\b{kw}\b', street):
+        if re.search(rf'\b{re.escape(kw)}\b', street):
             return False, f"Pre-Enrichment Disqualified: Residential indicator '{kw}' detected."
             
     return True, None
@@ -975,10 +1032,7 @@ class MarketHandler:
                 best_match = None
                 best_score = 0
                 for r in local:
-                    score = max(
-                        fuzz.token_set_ratio(norm_name, normalize_string(r.get("title", ""))),
-                        fuzz.partial_ratio(norm_name, normalize_string(r.get("title", ""))),
-                    )
+                    score = _best_fuzzy_score(norm_name, normalize_string(r.get("title", "")))
                     if score > best_score:
                         best_score = score
                         best_match = r
@@ -1029,7 +1083,7 @@ class MarketHandler:
         cuisines = extract_cuisines(place)
         data = {
             "google_name": place.get("title"),
-            "phone": place.get("phone"),
+            "phone": normalize_phone(place.get("phone"), self.country_code),
             "website": place.get("website"),
             "rating": place.get("rating"),
             "reviews": place.get("reviews"),
@@ -1149,10 +1203,7 @@ class UKMarketHandler(MarketHandler):
                 best_match = None
                 best_score = 0
                 for e in establishments:
-                    score = max(
-                        fuzz.token_set_ratio(search_name, normalize_string(e.get("BusinessName", ""))),
-                        fuzz.partial_ratio(search_name, normalize_string(e.get("BusinessName", ""))),
-                    )
+                    score = _best_fuzzy_score(search_name, normalize_string(e.get("BusinessName", "")))
                     if score > best_score:
                         best_score = score
                         best_match = e

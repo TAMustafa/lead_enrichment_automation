@@ -81,7 +81,7 @@ try:
     query = """
     SELECT Id, Company, Name, Phone, Website, Street, City, PostalCode, Country,
            Google_Place_ID__c, Store_Type__c, Price_Range__c, Google_Rating__c,
-           Google_Reviews__c, Service_Options__c, Payment_Options__c, Status, Qualification_Status__c,
+           Google_Reviews__c, Service_Options__c, Payment_Options__c, Qualification_Status__c,
            FSA_AGENCY__c, FSA_RATING__c, FSA_URL__c,
            Cuisine_Type__c, Primary_Cuisine__c, Secondary_Cuisine__c, Opening_Hours__c
     FROM Lead
@@ -119,7 +119,6 @@ def process_lead(row):
                 "Id": row["Id"],
                 "Qualification_Status__c": "Disqualified",
                 "Disqualification_Reason__c": sanitize_string(pre_reason),
-                "Status": "Disqualified",
                 "Date_Enriched_At__c": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
             return merged
@@ -156,11 +155,9 @@ def process_lead(row):
             merged["Qualification_Status__c"] = status
             if reason:
                 merged["Disqualification_Reason__c"] = sanitize_string(reason)
-                merged["Status"] = "Disqualified"
                 logger.info(f"Lead {row.get('Name')} disqualified: {reason}")
             else:
                 merged["Disqualification_Reason__c"] = None
-                merged["Status"] = "Qualified"
                 logger.info(f"Lead {row.get('Name')} qualified")
 
             # Competitor links: only written when a URL is actually found — never sends
