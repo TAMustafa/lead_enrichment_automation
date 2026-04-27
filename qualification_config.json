@@ -27,7 +27,19 @@
       "dentist",
       "pharmacy",
       "lodging",
-      "hotel"
+      "hotel",
+      "event_venue",
+      "wedding_venue",
+      "banquet_hall",
+      "convention_center",
+      "auditorium",
+      "concert_hall",
+      "performing_arts_theater",
+      "amusement_park",
+      "amusement_center",
+      "casino",
+      "stadium",
+      "arena"
     ],
     "residential_signals": [
       "premise",
